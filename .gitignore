@@ -1,0 +1,7 @@
+secrets.env
+__pycache__/
+*.pyc
+xla_cache/
+*.png
+*.jpg
+*.jpeg
