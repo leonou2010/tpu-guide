@@ -55,22 +55,40 @@ mkdir -p /tmp/tpu_wheels && tar xzf /tmp/tpu_wheels.tar.gz -C /tmp/tpu_wheels/ -
 python3 -m pip install --upgrade pip setuptools wheel -f /tmp/tpu_wheels --no-index -q
 pip3 install /tmp/tpu_wheels/*.whl --no-deps --force-reinstall -q
 rm -rf /tmp/tpu_wheels /tmp/tpu_wheels.tar.gz
+# Install deps missing from wheels bundle (--no-deps skips them)
+# Try pip install first (internet VMs), fall back to pre-built wheels on GCS (no-internet VMs)
+pip3 install 'antlr4-python3-runtime==4.9.3' -q 2>/dev/null || {
+  gsutil cp $BUCKET/wheels/antlr4_python3_runtime-4.9.3-py3-none-any.whl /tmp/antlr4_python3_runtime-4.9.3-py3-none-any.whl 2>/dev/null && \
+  pip3 install /tmp/antlr4_python3_runtime-4.9.3-py3-none-any.whl -q 2>/dev/null || true
+}
+pip3 install 'typing_extensions>=4.0' -q 2>/dev/null || {
+  gsutil cp $BUCKET/wheels/typing_extensions*.whl /tmp/ 2>/dev/null && \
+  pip3 install /tmp/typing_extensions*.whl -q 2>/dev/null || true
+}
+pip3 install 'numpy<2' -q 2>/dev/null || {
+  gsutil cp $BUCKET/wheels/numpy-*.whl /tmp/ 2>/dev/null && \
+  pip3 install /tmp/numpy-*.whl -q 2>/dev/null || true
+}
 
-echo "[5/8] Logging into W&B..."
+echo "[5/9] Logging into W&B..."
 mkdir -p ~/.config/wandb
 echo -e "machine api.wandb.ai\n  login user\n  password $WANDB_API_KEY" > ~/.netrc
 chmod 600 ~/.netrc
 
-echo "[6/8] Deploying code from GCS..."
+echo "[6/9] Deploying code from GCS..."
 mkdir -p ~/sf_bema/experiments
 gsutil cp $BUCKET/code/sf_bema_code_12c.tar.gz /tmp/sf_bema_code_12c.tar.gz
 tar -xz -C ~/sf_bema/experiments/ -f /tmp/sf_bema_code_12c.tar.gz
 
-echo "[7/8] Downloading dataset..."
+echo "[7/9] Downloading dataset..."
 mkdir -p ~/sf_bema/experiments/exp10_smollm2_smoltalk/data
 gsutil -m cp -r "$BUCKET/data/smoltalk/data/train" "$BUCKET/data/smoltalk/data/val" ~/sf_bema/experiments/exp10_smollm2_smoltalk/data/
 
-echo "[8/8] Setting XLA compilation cache + mmap limit..."
+echo "[8/9] Downloading model..."
+mkdir -p /tmp/SmolLM2-135M
+gsutil -m cp -r "$BUCKET/models/SmolLM2-135M/*" /tmp/SmolLM2-135M/
+
+echo "[9/9] Setting XLA compilation cache + mmap limit..."
 echo "export XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache" >> ~/.bashrc
 echo "export PJRT_DEVICE=TPU" >> ~/.bashrc
 mkdir -p /tmp/xla_cache

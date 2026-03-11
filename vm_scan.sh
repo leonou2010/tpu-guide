@@ -7,6 +7,8 @@ GRANTED_ZONES=(
   europe-west4-a    # 64 spot v6e
   us-east1-d        # 64 spot v6e
   us-central2-b     # 32 spot v4 + 32 on-demand v4
+  us-central1-a     # 64 spot v5e
+  europe-west4-b    # 64 spot v5e
 )
 
 # Also scan all other v6e zones for opportunistic VMs
@@ -102,10 +104,10 @@ echo ""
 echo "  europe-west4-a:  64 spot v6e chips  (has internet, W&B works)"
 echo "  us-east1-d:      64 spot v6e chips  (no internet, WANDB_MODE=disabled)"
 echo "  us-central2-b:   32 spot v4 + 32 on-demand v4 chips  (no internet)"
-echo "  us-central1-a:   64 spot v5e chips  (USELESS — OOM)"
-echo "  europe-west4-b:  64 spot v5e chips  (USELESS — OOM)"
+echo "  us-central1-a:   64 spot v5e chips  (OOM fixed — bs halved automatically)"
+echo "  europe-west4-b:  64 spot v5e chips  (OOM fixed — bs halved automatically)"
 echo ""
-echo "  Max usable: 64 + 64 + 64 = 192 chips"
+echo "  Max usable: 64 + 64 + 64 + 64 + 64 = 320 chips"
 echo ""
 
 # --- Capacity Status (updated manually) ---

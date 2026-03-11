@@ -14,23 +14,22 @@ Full design doc: `~/tpu_guide/COORDINATOR.md`
 ```bash
 # 1. Write experiment code (build_configs, build_command, run_single, preflight)
 # 2. Create ~/tpu_guide/experiments/<exp>.env (6 lines)
-# 3. Setup VMs
+
+# 3. Launch everything (acquires VMs, setup, init, sweep, monitor, fleet manager)
+EXP=<name> bash ~/tpu_guide/run.sh
+
+# 4. Monitor
+python3 ~/tpu_guide/dashboard.py --exp <name> --interval 30   # rich TUI
+tail -f /tmp/fleet_<name>.log                                   # fleet manager
+tail -f /tmp/monitor_<name>.log                                 # coordinator
+```
+
+run.sh handles the full lifecycle: VM acquisition → setup → config distribution → sweep → monitor + fleet manager (background). Fleet manager auto-recovers preempted VMs, expands fleet, and copies results when done.
+
+For debugging a single VM:
+```bash
 EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh --setup
-
-# 4. Preflight (once per VM type)
-EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh --preflight
-
-# 5. Distribute configs to all VMs (blocklab, once)
-EXP=<name> python3 ~/tpu_guide/coordinator.py --init
-
-# 6. Launch workers on each VM
 EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh --sweep
-
-# 7. Start coordinator loop (blocklab, long-running)
-EXP=<name> python3 ~/tpu_guide/coordinator.py --monitor
-
-# 8. Monitor (separate terminal)
-EXP=<name> bash ~/tpu_guide/watch.sh
 ```
 
 ## Commands
@@ -44,7 +43,15 @@ EXP=<name> bash ~/tpu_guide/watch.sh
 | `coordinator.py --status` | One-shot status of all VMs and configs |
 | `coordinator.py --dry-run` | Print all configs without distributing |
 
-### Per-VM (submit.sh)
+### Fleet (submit.sh, no TPU_NAME needed)
+
+| Command | What it does |
+|---------|-------------|
+| `--setup-all` | Setup all VMs in `vm_configs/` |
+| `--sweep-all` | Launch workers on all VMs |
+| `--cancel-all` | Cancel all VMs |
+
+### Per-VM (submit.sh, TPU_NAME required)
 
 | Command | What it does |
 |---------|-------------|
@@ -59,6 +66,12 @@ EXP=<name> bash ~/tpu_guide/watch.sh
 | `--pull-results` | Download results from GCS to local |
 | `--push-cache` / `--pull-cache` | Sync XLA compilation cache to/from GCS |
 
+### Autonomous (started by run.sh)
+
+| Command | What it does |
+|---------|-------------|
+| `fleet_manager.sh` | Every 10 min: recover dead VMs, expand fleet, check monitor, copy results when done |
+
 ## Monitoring
 
 ```bash
@@ -72,8 +85,11 @@ bash ~/tpu_guide/vm_scan.sh                                    # fleet: VMs + qu
 
 ```
 ~/tpu_guide/
+  run.sh                # Master script — single entry point for full experiment
+  fleet_manager.sh      # Automated lifecycle: preemption, expansion, completion
   coordinator.py        # Centralized push coordinator
-  submit.sh             # Per-VM submit script
+  submit.sh             # Per-VM + fleet submit script
+  setup.sh              # VM setup (packages, code, data, model)
   watch.sh              # Auto-refresh monitor
   dashboard.py          # Rich TUI dashboard
   vm_scan.sh            # Fleet scanner

@@ -9,8 +9,11 @@
 #   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --preflight
 #   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --status
 #   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --cancel
-#   EXP=exp12c python3 ~/tpu_guide/coordinator.py --init      # distribute configs (blocklab)
-#   EXP=exp12c python3 ~/tpu_guide/coordinator.py --monitor   # coordination loop (blocklab)
+#   EXP=exp12c bash ~/tpu_guide/submit.sh --setup-all    # iterate all vm_configs/*.env
+#   EXP=exp12c bash ~/tpu_guide/submit.sh --sweep-all
+#   EXP=exp12c bash ~/tpu_guide/submit.sh --cancel-all
+#   EXP=exp12c bash ~/tpu_guide/submit.sh --init          # distribute configs (blocklab)
+#   EXP=exp12c bash ~/tpu_guide/submit.sh --monitor       # coordination loop (blocklab)
 
 set -euo pipefail
 
@@ -22,7 +25,8 @@ MODE=${1:---status}
 # ── Validate required env vars ──────────────────────────────────────────────
 
 EXP=${EXP:?'EXP env var required (e.g. EXP=exp12c)'}
-TPU_NAME=${TPU_NAME:?'TPU_NAME env var required (e.g. TPU_NAME=v6e-ew4a)'}
+# TPU_NAME validation deferred — not needed for --*-all commands
+TPU_NAME=${TPU_NAME:-}
 
 # ── Load experiment config ──────────────────────────────────────────────────
 
@@ -37,9 +41,11 @@ source "$EXP_CONFIG"
 
 # ── Load VM config ──────────────────────────────────────────────────────────
 
-VM_CONFIG="$SCRIPT_DIR/vm_configs/${TPU_NAME}.env"
-if [ -f "$VM_CONFIG" ]; then
-  source "$VM_CONFIG"
+if [ -n "$TPU_NAME" ]; then
+  VM_CONFIG="$SCRIPT_DIR/vm_configs/${TPU_NAME}.env"
+  if [ -f "$VM_CONFIG" ]; then
+    source "$VM_CONFIG"
+  fi
 fi
 
 # Per-VM settings (env vars override vm_config)
@@ -58,7 +64,9 @@ SESSION=${EXP_NAME}
 RESULTS_GCS=$BUCKET/results/${EXP_NAME}
 CODE_TAR="sf_bema_code_${EXP_NAME}.tar.gz"
 
-echo "[vm] $TPU_NAME  zone=$ZONE  workers=$TPU_NUM_WORKERS  procs/host=$PROCS_PER_HOST  exp=$EXP_NAME"
+if [ -n "$TPU_NAME" ]; then
+  echo "[vm] $TPU_NAME  zone=$ZONE  workers=$TPU_NUM_WORKERS  procs/host=$PROCS_PER_HOST  exp=$EXP_NAME"
+fi
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -83,19 +91,64 @@ push_code() {
 
   echo "[code 3/3] Pulling on ALL $TPU_NUM_WORKERS workers..."
   all_workers "mkdir -p ~/sf_bema/experiments && gsutil cp $BUCKET/code/$CODE_TAR /tmp/$CODE_TAR && tar -xz -C ~/sf_bema/experiments/ -f /tmp/$CODE_TAR && gsutil cp $BUCKET/code/coordinator.py ~/coordinator.py && gsutil cp $BUCKET/code/${EXP}.env ~/experiments_${EXP}.env"
+
+  # Ensure data directory exists in WORK_DIR (symlink to canonical location if needed)
+  DATA_CANONICAL=~/sf_bema/experiments/exp10_smollm2_smoltalk/data
+  DATA_TARGET=~/sf_bema/experiments/$WORK_DIR/data
+  if [ "$WORK_DIR" != "exp10_smollm2_smoltalk" ]; then
+    echo "[code] Ensuring data symlink: $WORK_DIR/data -> exp10_smollm2_smoltalk/data"
+    all_workers "if [ -d $DATA_CANONICAL ] && [ ! -e $DATA_TARGET ]; then ln -s $DATA_CANONICAL $DATA_TARGET; echo 'data symlink created'; elif [ -e $DATA_TARGET ]; then echo 'data already exists'; else echo 'WARNING: canonical data not found at $DATA_CANONICAL'; fi"
+  fi
   echo "Code deployed to all workers."
 }
 
 pull_xla_cache() {
-  echo "[xla-cache] Pulling cached XLA graphs from GCS to all workers..."
-  all_workers "mkdir -p /tmp/xla_cache && gsutil -m cp -r '$BUCKET/xla_cache/*' /tmp/xla_cache/ 2>/dev/null; echo XLA_PULL_\$(ls /tmp/xla_cache/ 2>/dev/null | wc -l)_files"
+  # v5e uses a separate XLA cache (v6e/v4/v5e caches are incompatible)
+  local CACHE_GCS_PATH="$BUCKET/xla_cache"
+  local ACCEL=${ACCELERATOR_TYPE:-}
+  if [[ "$ACCEL" == *v5* ]]; then
+    CACHE_GCS_PATH="$BUCKET/xla_cache_v5e"
+  fi
+  echo "[xla-cache] Pulling XLA cache from $CACHE_GCS_PATH (accel=$ACCEL)..."
+  all_workers "
+    echo '[xla-cache] Checking GCS for cached XLA graphs...'
+    mkdir -p /tmp/xla_cache
+    BEFORE=\$(ls /tmp/xla_cache/ 2>/dev/null | wc -l)
+    gsutil -m cp -r '$CACHE_GCS_PATH/*' /tmp/xla_cache/ 2>/dev/null || true
+    AFTER=\$(ls /tmp/xla_cache/ 2>/dev/null | wc -l)
+    echo \"[xla-cache] XLA cache: \${BEFORE} files before, \${AFTER} files after pull (from $CACHE_GCS_PATH)\"
+    if [ \"\$AFTER\" -gt 0 ]; then
+      echo '[xla-cache] XLA cache loaded — compile should be fast (~30s vs ~10min)'
+    else
+      echo '[xla-cache] No XLA cache found — first compile will take ~10 minutes'
+    fi
+  "
 }
 
 push_xla_cache() {
-  echo "[xla-cache] Pushing XLA cache from worker 0 to GCS..."
+  # v5e uses separate cache path
+  local CACHE_GCS_PATH="$BUCKET/xla_cache"
+  local ACCEL=${ACCELERATOR_TYPE:-}
+  if [[ "$ACCEL" == *v5* ]]; then
+    CACHE_GCS_PATH="$BUCKET/xla_cache_v5e"
+  fi
+  echo "[xla-cache] Pushing XLA cache from worker 0 to $CACHE_GCS_PATH..."
   $GCLOUD alpha compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE --project=$PROJECT --tunnel-through-iap \
-    --worker=0 --command="gsutil -m cp -r /tmp/xla_cache/* $BUCKET/xla_cache/ 2>/dev/null; echo XLA_PUSH_\$(ls /tmp/xla_cache/ 2>/dev/null | wc -l)_files" 2>/dev/null
+    --worker=0 --command="
+      echo '[xla-cache] Checking /tmp/xla_cache...'
+      FILES=\$(ls /tmp/xla_cache/ 2>/dev/null | wc -l)
+      SIZE=\$(du -sh /tmp/xla_cache/ 2>/dev/null | cut -f1)
+      echo \"[xla-cache] Found \$FILES files (\$SIZE)\"
+      if [ \"\$FILES\" -gt 0 ]; then
+        echo '[xla-cache] Uploading to GCS...'
+        gsutil -m cp -r /tmp/xla_cache/* $CACHE_GCS_PATH/ 2>&1 | tail -3
+        echo '[xla-cache] Push complete'
+      else
+        echo '[xla-cache] WARNING: No XLA cache files found. Cache env var may not be working.'
+        echo '[xla-cache] Check: XLA_PERSISTENT_CACHE_PATH and XLA_COMPILATION_CACHE_PATH'
+      fi
+    " 2>/dev/null
 }
 
 launch_all() {
@@ -104,7 +157,7 @@ launch_all() {
   local barrier_id=$(date +%s)
 
   # Build env exports inline (compatible with all tmux versions, avoids -e flag)
-  local ENV_EXPORTS="export PJRT_DEVICE=TPU BUCKET=$BUCKET XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache LLVM_NUM_THREADS=32 BARRIER_RUN_ID=$barrier_id TPU_NUM_WORKERS=$TPU_NUM_WORKERS LAUNCH_MODE=$LAUNCH_MODE CHIPS_PER_HOST=$CHIPS_PER_HOST WANDB_MODE=${WANDB_MODE:-online} MODEL_PATH=$MODEL_PATH HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HYDRA_FULL_ERROR=1 EXP=$EXP TPU_NAME=$TPU_NAME"
+  local ENV_EXPORTS="export PJRT_DEVICE=TPU BUCKET=$BUCKET XLA_PERSISTENT_CACHE_PATH=/tmp/xla_cache XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache LLVM_NUM_THREADS=32 BARRIER_RUN_ID=$barrier_id TPU_NUM_WORKERS=$TPU_NUM_WORKERS LAUNCH_MODE=$LAUNCH_MODE CHIPS_PER_HOST=$CHIPS_PER_HOST WANDB_MODE=${WANDB_MODE:-online} MODEL_PATH=$MODEL_PATH HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HYDRA_FULL_ERROR=1 EXP=$EXP TPU_NAME=$TPU_NAME ACCELERATOR_TYPE=${ACCELERATOR_TYPE:-}"
   # LIBTPU_INIT_ARGS needs special quoting (contains spaces)
   ENV_EXPORTS="$ENV_EXPORTS; export LIBTPU_INIT_ARGS='$LIBTPU_INIT_ARGS'"
   if [ "$LAUNCH_MODE" = "single" ]; then
@@ -142,11 +195,16 @@ PROCS=\$1; TOTAL=\$2; WM=\$3; BKT=\$4; EXP_ARG=\$5; TPUNAME=\$6; WORKDIR=\$7; MD
 WH=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number" -H "Metadata-Flavor: Google" 2>/dev/null || echo 0)
 
 # Kill existing sessions and zombie TPU processes
-for s in \$(tmux list-sessions 2>/dev/null | grep ${EXP_NAME} | cut -d: -f1); do
+for s in \$(tmux list-sessions 2>/dev/null | cut -d: -f1); do
   tmux kill-session -t "\$s" 2>/dev/null
 done
 { fuser /dev/vfio/* 2>/dev/null; fuser /dev/accel* 2>/dev/null; } | xargs -r kill -9 2>/dev/null || true
 sleep 1
+
+# Clean stale checkpoints from previous runs (prevents xla:0 load crash)
+echo "Cleaning stale checkpoints..."
+rm -f /tmp/ckpt_*.pt 2>/dev/null
+echo "  Cleaned \$(ls /tmp/ckpt_*.pt 2>/dev/null | wc -l) remaining checkpoint files"
 
 # Create experiments dir for coordinator config
 mkdir -p ~/tpu_guide/experiments
@@ -161,7 +219,7 @@ for p in \$(seq 0 \$((\$PROCS - 1))); do
   WID="\${TPUNAME}_\${WH}_\${p}"
   PROC_IDX=\$((\${WH} * \${PROCS} + \${p}))
   tmux new-session -d -s "${EXP_NAME}_\${p}" \
-    "export PATH=\$HOME/miniconda3/bin:\$HOME/.local/bin:\$PATH; export PJRT_DEVICE=TPU TPU_PROCESS_BOUNDS=1,1,1 TPU_NUM_WORKERS=1 TPU_VISIBLE_CHIPS=\${p} XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache CHECKPOINT_DIR=/tmp WANDB_MODE=\${WM} MODEL_PATH=\${MDLPATH} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 BUCKET=\${BKT} LLVM_NUM_THREADS=32 EXP=\${EXP_ARG} TPU_NAME=\${TPUNAME} WORKER_IDX=\${WH}; export LIBTPU_INIT_ARGS='\${LIBTPU}'; cd ~/sf_bema/experiments/\${WORKDIR} && EXP=\${EXP_ARG} python3 -u ~/tpu_guide/coordinator.py --sweep --worker-id=\${WID} --proc-idx=\${PROC_IDX} --num-procs=\${TOTAL} 2>&1 | tee /tmp/${EXP_NAME}_\${p}.log; echo SWEEP_DONE_\${p}"
+    "export PATH=\$HOME/miniconda3/bin:\$HOME/.local/bin:\$PATH; export PJRT_DEVICE=TPU TPU_PROCESS_BOUNDS=1,1,1 TPU_NUM_WORKERS=1 TPU_VISIBLE_CHIPS=\${p} XLA_PERSISTENT_CACHE_PATH=/tmp/xla_cache XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache CHECKPOINT_DIR=/tmp WANDB_MODE=\${WM} MODEL_PATH=\${MDLPATH} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 BUCKET=\${BKT} LLVM_NUM_THREADS=32 EXP=\${EXP_ARG} TPU_NAME=\${TPUNAME} WORKER_IDX=\${WH} ACCELERATOR_TYPE=${ACCELERATOR_TYPE:-}; export LIBTPU_INIT_ARGS='\${LIBTPU}'; cd ~/sf_bema/experiments/\${WORKDIR} && EXP=\${EXP_ARG} python3 -u ~/tpu_guide/coordinator.py --sweep --worker-id=\${WID} --proc-idx=\${PROC_IDX} --num-procs=\${TOTAL} 2>&1 | tee /tmp/${EXP_NAME}_\${p}.log; echo SWEEP_DONE_\${p}"
 done
 echo "Host \${WH}: launched \${PROCS} procs (coordinator workers)"
 LAUNCHER_HEREDOC
@@ -180,6 +238,10 @@ LAUNCHER_HEREDOC
 # ── Commands ────────────────────────────────────────────────────────────────
 
 case $MODE in
+
+  --setup|--preflight|--auto|--sweep|--push-code|--status|--logs|--cancel|--pull-results|--push-cache|--pull-cache)
+    if [ -z "$TPU_NAME" ]; then echo "ERROR: TPU_NAME required for $MODE"; exit 1; fi
+    ;;&
 
   --setup)
     echo "=== VM SETUP ($TPU_NUM_WORKERS workers) ==="
@@ -285,16 +347,41 @@ case $MODE in
     pull_xla_cache
     ;;
 
+  --setup-all)
+    echo "=== SETUP ALL VMs ==="
+    for cfg in "$SCRIPT_DIR"/vm_configs/*.env; do
+      vm=$(basename "$cfg" .env)
+      echo "--- Setting up $vm ---"
+      EXP=$EXP TPU_NAME=$vm bash "$0" --setup || echo "WARN: $vm setup failed"
+    done
+    ;;
+
+  --sweep-all)
+    echo "=== SWEEP ALL VMs ==="
+    for cfg in "$SCRIPT_DIR"/vm_configs/*.env; do
+      vm=$(basename "$cfg" .env)
+      echo "--- Sweeping $vm ---"
+      EXP=$EXP TPU_NAME=$vm bash "$0" --sweep || echo "WARN: $vm sweep failed"
+    done
+    ;;
+
+  --cancel-all)
+    echo "=== CANCEL ALL VMs ==="
+    for cfg in "$SCRIPT_DIR"/vm_configs/*.env; do
+      vm=$(basename "$cfg" .env)
+      echo "--- Cancelling $vm ---"
+      EXP=$EXP TPU_NAME=$vm bash "$0" --cancel || echo "WARN: $vm cancel failed"
+    done
+    ;;
+
   *)
     echo "Usage: EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh <command>"
     echo ""
-    echo "Commands:"
+    echo "Per-VM commands (require TPU_NAME):"
     echo "  --setup        Install packages, deploy code+data+model"
     echo "  --preflight    Quick run (~5 min): XLA compile + measure step time/HBM"
     echo "  --auto         Preflight → sweep"
-    echo "  --init         Distribute configs to VMs (blocklab, run once)"
     echo "  --sweep        Launch workers on this VM (reads assignment from GCS)"
-    echo "  --monitor      Start coordination loop (blocklab, long-running)"
     echo "  --push-code    Deploy code only"
     echo "  --status       Show tmux sessions + coordinator status"
     echo "  --logs         Tail live logs from worker-0"
@@ -302,5 +389,14 @@ case $MODE in
     echo "  --pull-results Download results from GCS"
     echo "  --push-cache   Push XLA cache to GCS"
     echo "  --pull-cache   Pull XLA cache from GCS"
+    echo ""
+    echo "Fleet commands (iterate all vm_configs/*.env):"
+    echo "  --setup-all    Run --setup on every VM"
+    echo "  --sweep-all    Run --sweep on every VM"
+    echo "  --cancel-all   Run --cancel on every VM"
+    echo ""
+    echo "Coordinator commands (no TPU_NAME needed):"
+    echo "  --init         Distribute configs to VMs (blocklab, run once)"
+    echo "  --monitor      Start coordination loop (blocklab, long-running)"
     ;;
 esac

@@ -86,26 +86,22 @@ gs://<VM_BUCKET>/coord/<EXP_NAME>/
 ```bash
 # 1. Write experiment code + run_tpu.py with build_configs(), build_command()
 # 2. Create ~/tpu_guide/experiments/exp13.env (6 lines)
-# 3. Setup VMs (once per VM)
-EXP=exp13 TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --setup
+# 3. Create ~/tpu_guide/vm_configs/<vm>.env for each VM
 
-# 4. Preflight (once per VM type)
-EXP=exp13 TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --preflight
-
-# 5. Distribute configs to all VMs (blocklab, once)
+# 4. Setup + init + sweep ALL VMs (one command each)
+EXP=exp13 bash ~/tpu_guide/submit.sh --setup-all
 EXP=exp13 python3 ~/tpu_guide/coordinator.py --init
+EXP=exp13 bash ~/tpu_guide/submit.sh --sweep-all
 
-# 6. Launch workers on each VM
-EXP=exp13 TPU_NAME=v6e-ew4a   bash ~/tpu_guide/submit.sh --sweep
-EXP=exp13 TPU_NAME=v4-uc2b    bash ~/tpu_guide/submit.sh --sweep
-# ... repeat for each VM
-
-# 7. Start coordinator loop (blocklab, long-running)
+# 5. Start coordinator + babysitter (both long-running)
 EXP=exp13 python3 ~/tpu_guide/coordinator.py --monitor
+EXP=exp13 TOTAL=185 bash ~/tpu_guide/babysit.sh
 
-# 8. Monitor dashboard (separate terminal)
+# 6. Monitor (separate terminal)
 EXP=exp13 bash ~/tpu_guide/watch.sh
 ```
+
+Per-VM (for debugging): `EXP=exp13 TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --setup`
 
 ## Rebalancing Strategy
 

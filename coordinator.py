@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -126,6 +127,8 @@ def load_vm_configs():
             cfg['STEP_S'] = 4.9
         elif accel.startswith('v4'):
             cfg['STEP_S'] = 8.4
+        elif accel.startswith('v5'):
+            cfg['STEP_S'] = 6.0
         else:
             continue  # Unknown accelerator, skip
 
@@ -192,6 +195,21 @@ def gcs_read(path):
         return None
     except (subprocess.TimeoutExpired, Exception):
         return None
+
+
+def gcs_read_batch(paths, max_workers=20):
+    """Read multiple GCS paths in parallel. Returns dict: {path: content_or_None}."""
+    import concurrent.futures
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(gcs_read, p): p for p in paths}
+        for fut in concurrent.futures.as_completed(futures):
+            p = futures[fut]
+            try:
+                results[p] = fut.result()
+            except Exception:
+                results[p] = None
+    return results
 
 
 def gcs_exists(path):
@@ -330,16 +348,18 @@ def read_heartbeats(bucket, cfg, tpu_name):
 
 
 def read_all_heartbeats_from_bucket(bucket, cfg):
-    """Read ALL heartbeat files from a bucket in one pass.
+    """Read ALL heartbeat files from a bucket in one pass (parallel).
 
     Returns dict: {tpu_name: [heartbeat_dicts]}
-    More efficient than calling read_heartbeats per-VM for shared buckets.
+    Uses batch parallel reads to avoid sequential subprocess bottleneck.
     """
     prefix = f"{bucket}/coord/{cfg['EXP_NAME']}/heartbeat"
     paths = gcs_list(prefix)
     by_vm = {}
-    for p in paths:
-        content = gcs_read(p)
+    if not paths:
+        return by_vm
+    batch = gcs_read_batch(paths, max_workers=min(len(paths), 20))
+    for p, content in batch.items():
         if not content:
             continue
         try:
@@ -664,7 +684,7 @@ class SweepState:
 
         Returns count of newly validated results this cycle.
         """
-        new_done = self.gcs_done - self.validated
+        new_done = self.gcs_done - self.validated - self.failed
         pulled = 0
 
         for label in new_done:
@@ -685,9 +705,41 @@ class SweepState:
                             os.remove(local_path)
                             self.retries[label] = self.retries.get(label, 0) + 1
                             if self.retries[label] >= MAX_RETRIES:
-                                print(f"  [validate] {label} failed {self.retries[label]}x, marking as FAILED")
+                                other_zone_vms = [v.config for v in self.alive_vms
+                                                  if v.config.get('ZONE') != vm.config.get('ZONE')]
+                                if other_zone_vms:
+                                    print(f"  [validate] {label}: failed {self.retries[label]}x, reassigning to different zone")
+                                    done_path = f"{vm.bucket}/coord/{self.cfg['EXP_NAME']}/done/{label}.done"
+                                    gcs_delete(done_path)
+                                    self._append_to_assignments({label}, other_zone_vms)
+                                    self.retries[label] = 0
+                                    self.log_event("CROSS_ZONE_RETRY", f"{label}: validation failed, retrying in other zone")
+                                else:
+                                    print(f"  [validate] {label} failed {self.retries[label]}x, marking as FAILED")
+                                    self.failed.add(label)
+                                    self.log_event("FAILED", f"{label} after {self.retries[label]} retries")
+                    else:
+                        # No result uploaded — likely worker crashed (failed_rc*)
+                        self.retries[label] = self.retries.get(label, 0) + 1
+                        done_path = f"{vm.bucket}/coord/{self.cfg['EXP_NAME']}/done/{label}.done"
+                        if self.retries[label] >= MAX_RETRIES:
+                            # Instead of permanent failure, try reassigning to a different zone
+                            other_zone_vms = [v.config for v in self.alive_vms
+                                              if v.config.get('ZONE') != vm.config.get('ZONE')]
+                            if other_zone_vms:
+                                print(f"  [retry] {label}: failed {self.retries[label]}x on {vm.name}, reassigning to different zone")
+                                gcs_delete(done_path)
+                                self._append_to_assignments({label}, other_zone_vms)
+                                self.retries[label] = 0  # Reset retries for new zone
+                                self.log_event("CROSS_ZONE_RETRY", f"{label}: from {vm.name} zone to other zone")
+                            else:
+                                print(f"  [retry] {label}: no result found {self.retries[label]}x, marking as FAILED (no other zones)")
                                 self.failed.add(label)
-                                self.log_event("FAILED", f"{label} after {self.retries[label]} retries")
+                                self.log_event("FAILED", f"{label}: no result after {self.retries[label]} retries")
+                        else:
+                            print(f"  [retry] {label}: no result found (attempt {self.retries[label]}/{MAX_RETRIES}), deleting done receipt for retry")
+                            gcs_delete(done_path)
+                            self.log_event("RETRY", f"{label}: deleted done receipt (attempt {self.retries[label]})")
                     break  # Found the bucket, move on
 
         return pulled
@@ -992,6 +1044,199 @@ class SweepState:
               f"cycle={cycle_elapsed:.1f}s")
 
 
+# ── Experiment Queue ───────────────────────────────────────────────────────
+
+class ExperimentQueue:
+    """Manages a sequential queue of experiments in ~/tpu_guide/queue.json."""
+    QUEUE_FILE = os.path.expanduser('~/tpu_guide/queue.json')
+
+    def __init__(self):
+        self.experiments = []
+        self.load()
+
+    def load(self):
+        if os.path.isfile(self.QUEUE_FILE):
+            with open(self.QUEUE_FILE) as f:
+                self.experiments = json.load(f)
+        else:
+            self.experiments = []
+
+    def save(self):
+        with open(self.QUEUE_FILE, 'w') as f:
+            json.dump(self.experiments, f, indent=2)
+
+    def enqueue(self, exp_name):
+        # Validate experiment config exists
+        env_path = os.path.expanduser(f'~/tpu_guide/experiments/{exp_name}.env')
+        if not os.path.isfile(env_path):
+            print(f"[queue] ERROR: experiment config not found: {env_path}", file=sys.stderr)
+            sys.exit(1)
+        # Check not already in queue
+        for e in self.experiments:
+            if e['exp'] == exp_name and e['status'] in ('pending', 'running'):
+                print(f"[queue] {exp_name} already in queue (status={e['status']})")
+                return
+        self.experiments.append({
+            'exp': exp_name,
+            'status': 'pending',
+            'enqueued_at': time.time(),
+        })
+        self.save()
+        print(f"[queue] Enqueued: {exp_name} (position {len([e for e in self.experiments if e['status'] == 'pending'])})")
+
+    def dequeue(self, exp_name):
+        before = len(self.experiments)
+        self.experiments = [e for e in self.experiments if e['exp'] != exp_name]
+        self.save()
+        removed = before - len(self.experiments)
+        if removed:
+            print(f"[queue] Removed: {exp_name}")
+        else:
+            print(f"[queue] {exp_name} not found in queue")
+
+    def next_pending(self):
+        for e in self.experiments:
+            if e['status'] == 'pending':
+                return e
+        return None
+
+    def mark_running(self, exp_name):
+        for e in self.experiments:
+            if e['exp'] == exp_name:
+                e['status'] = 'running'
+                e['started_at'] = time.time()
+        self.save()
+
+    def mark_done(self, exp_name):
+        for e in self.experiments:
+            if e['exp'] == exp_name:
+                e['status'] = 'done'
+                e['finished_at'] = time.time()
+        self.save()
+
+    def status_report(self):
+        if not self.experiments:
+            print("[queue] Queue is empty")
+            return
+        print(f"[queue] {len(self.experiments)} experiment(s):")
+        for i, e in enumerate(self.experiments):
+            status = e['status'].upper()
+            exp = e['exp']
+            extra = ''
+            if e.get('total_configs'):
+                extra += f" configs={e['total_configs']}"
+            if e.get('started_at') and e['status'] == 'running':
+                elapsed = (time.time() - e['started_at']) / 3600
+                extra += f" running={elapsed:.1f}h"
+            if e.get('finished_at') and e['status'] == 'done':
+                dur = (e['finished_at'] - e.get('started_at', e['finished_at'])) / 3600
+                extra += f" duration={dur:.1f}h"
+            print(f"  {i+1}. [{status}] {exp}{extra}")
+
+
+def deploy_to_fleet(exp_name, cfg, vm_configs, prev_exp=None):
+    """Deploy code and launch sweep workers on all VMs."""
+    submit_sh = os.path.expanduser('~/tpu_guide/submit.sh')
+    for vc in vm_configs:
+        tpu_name = vc['TPU_NAME']
+        env = {**os.environ}
+        for key in ['TPU_NAME', 'ZONE', 'BUCKET', 'TPU_NUM_WORKERS',
+                     'PROCS_PER_HOST', 'CHIPS_PER_HOST', 'ACCELERATOR_TYPE',
+                     'WANDB_MODE', 'LAUNCH_MODE', 'LIBTPU_INIT_ARGS',
+                     'MODEL_PATH']:
+            if key in vc:
+                env[key] = str(vc[key])
+        env['EXP'] = exp_name
+
+        # Cancel previous experiment workers if switching
+        if prev_exp and prev_exp != exp_name:
+            cancel_env = {**env, 'EXP': prev_exp}
+            try:
+                subprocess.run(['bash', submit_sh, '--cancel'],
+                              env=cancel_env, timeout=120, capture_output=True)
+            except (subprocess.TimeoutExpired, Exception) as e:
+                print(f"[deploy] Warning: cancel on {tpu_name} failed: {e}")
+
+        # Deploy + launch
+        print(f"[deploy] {exp_name} -> {tpu_name}")
+        try:
+            subprocess.run(['bash', submit_sh, '--sweep'], env=env, timeout=600)
+        except (subprocess.TimeoutExpired, Exception) as e:
+            print(f"[deploy] Warning: sweep launch on {tpu_name} failed: {e}")
+
+
+def copy_validated_results(cfg):
+    """Copy validated results to experiment folder."""
+    src = os.path.expanduser(f"~/sf_bema/results/{cfg['EXP_NAME']}/validated/")
+    if not os.path.isdir(src):
+        print(f"[queue] No validated results dir: {src}")
+        return
+    module_dir = cfg['EXP_MODULE'].split('.')[0]
+    dst = os.path.expanduser(f"~/sf_bema/experiments/{cfg['WORK_DIR']}/{module_dir}/results/")
+    os.makedirs(dst, exist_ok=True)
+    count = 0
+    for f in os.listdir(src):
+        if f.endswith('.json'):
+            shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
+            count += 1
+    print(f"[queue] Copied {count} results to {dst}")
+
+
+def queue_monitor():
+    """Process experiment queue sequentially. Long-running."""
+    queue = ExperimentQueue()
+    prev_exp = None
+
+    while True:
+        queue.load()
+        entry = queue.next_pending()
+        if not entry:
+            # Check for crash recovery — resume running experiment
+            running = [e for e in queue.experiments if e['status'] == 'running']
+            if running:
+                entry = running[0]
+                print(f"[queue] Resuming running experiment: {entry['exp']}")
+            else:
+                print("[queue] No pending experiments. Sleeping 60s...")
+                time.sleep(60)
+                continue
+
+        exp_name = entry['exp']
+        queue.mark_running(exp_name)
+        print(f"\n[queue] === Starting: {exp_name} ===")
+
+        os.environ['EXP'] = exp_name
+        cfg = load_exp_config()
+        module = load_exp_module(cfg)
+        vm_configs = load_vm_configs()
+
+        # Update queue entry with config count
+        for e in queue.experiments:
+            if e['exp'] == exp_name:
+                try:
+                    configs = module.build_configs()
+                    e['total_configs'] = len(configs)
+                except Exception:
+                    pass
+        queue.save()
+
+        # Init + distribute
+        init_experiment(cfg, module, vm_configs)
+
+        # Deploy code + launch workers on ALL VMs
+        deploy_to_fleet(exp_name, cfg, vm_configs, prev_exp)
+
+        # Monitor until complete (blocks)
+        monitor_experiment(cfg, module, vm_configs)
+
+        # Copy results
+        copy_validated_results(cfg)
+
+        queue.mark_done(exp_name)
+        prev_exp = exp_name
+        print(f"[queue] === {exp_name} COMPLETE ===\n")
+
+
 # ── Mode: --init ───────────────────────────────────────────────────────────
 
 def init_experiment(cfg, module, vm_configs):
@@ -1115,7 +1360,7 @@ def show_status(cfg, vm_configs):
 
 # ── Mode: --sweep (worker) ─────────────────────────────────────────────────
 
-def write_heartbeat(prefix, worker_id, step, label, tpu_name):
+def write_heartbeat(prefix, worker_id, step, label, tpu_name, status="running"):
     """Write a JSON heartbeat to GCS."""
     hb = {
         'worker_id': worker_id,
@@ -1123,6 +1368,7 @@ def write_heartbeat(prefix, worker_id, step, label, tpu_name):
         'timestamp': time.time(),
         'step': step,
         'label': label,
+        'status': status,
     }
     path = f"{prefix}/heartbeat/{worker_id}.json"
     gcs_write(path, json.dumps(hb))
@@ -1146,8 +1392,8 @@ def run_with_heartbeat(cmd, prefix, worker_id, label, tpu_name, log_path):
     done_re = re.compile(r'^DONE: (.+)$')
     captured_run_name = None
 
-    # Write initial heartbeat
-    write_heartbeat(prefix, worker_id, 0, label, tpu_name)
+    # Write initial heartbeat with "xla_compile" status
+    write_heartbeat(prefix, worker_id, 0, label, tpu_name, status="xla_compile")
 
     with open(log_path, 'w') as log:
         for line in iter(proc.stdout.readline, ''):  # Patch 3: reliable pipe reading
@@ -1156,7 +1402,11 @@ def run_with_heartbeat(cmd, prefix, worker_id, label, tpu_name, log_path):
 
             m = step_re.search(line)
             if m:
-                last_step = int(m.group(1))
+                new_step = int(m.group(1))
+                if new_step > 0 and last_step == 0:
+                    # First real step — XLA compile done, now training
+                    write_heartbeat(prefix, worker_id, new_step, label, tpu_name, status="training")
+                last_step = new_step
 
             # Capture run_name from training script's "DONE: <run_name>" output
             dm = done_re.search(line.strip())
@@ -1164,7 +1414,8 @@ def run_with_heartbeat(cmd, prefix, worker_id, label, tpu_name, log_path):
                 captured_run_name = dm.group(1).strip()
 
             if time.time() - last_hb_time > HEARTBEAT_INTERVAL:
-                write_heartbeat(prefix, worker_id, last_step, label, tpu_name)
+                status = "training" if last_step > 0 else "xla_compile"
+                write_heartbeat(prefix, worker_id, last_step, label, tpu_name, status=status)
                 last_hb_time = time.time()
 
     proc.wait()
@@ -1260,23 +1511,45 @@ def worker_sweep(cfg, module, worker_id, tpu_name, proc_idx, num_procs):
     print(f"[sweep] Bucket: {bucket}", flush=True)
     print(f"[sweep] Work dir: {work_dir}", flush=True)
 
+    # Helper: upload last N lines of this worker's log to GCS for remote debugging
+    def upload_log_tail(msg=""):
+        """Upload last 100 lines of worker log to GCS so blocklab can debug without SSH."""
+        log_file = f"/tmp/{cfg['EXP_NAME']}_{proc_idx}.log"
+        try:
+            lines = []
+            if os.path.exists(log_file):
+                with open(log_file) as f:
+                    lines = f.readlines()[-100:]
+            content = f"=== {worker_id} log tail ({msg}) @ {time.strftime('%H:%M:%S')} ===\n" + "".join(lines)
+            gcs_write(f"{prefix}/logs/{worker_id}.log", content)
+        except Exception as e:
+            print(f"[sweep] Warning: log upload failed: {e}", flush=True)
+
+    # Write initial heartbeat so dashboard knows we're alive
+    write_heartbeat(prefix, worker_id, 0, "starting", tpu_name, status="starting")
+
     while True:
         # Read this VM's assignment (coordinator may update it with rebalanced configs)
+        print(f"[sweep] Reading assignment from {prefix}/assignments/{tpu_name}.json ...", flush=True)
         raw = gcs_read(f"{prefix}/assignments/{tpu_name}.json")
         if raw is None:
             # Assignment file deleted -> coordinator says we're done (or we're dead)
             print(f"[sweep] Assignment file gone. Exiting.", flush=True)
+            upload_log_tail("assignment_gone")
             break
 
         try:
             assignment = json.loads(raw)
         except json.JSONDecodeError:
             print(f"[sweep] Failed to parse assignment JSON. Retrying in 60s...", flush=True)
+            upload_log_tail("bad_json")
             time.sleep(60)
             continue
 
         # Static partition: this proc takes every num_procs-th config
         my_configs = assignment[proc_idx::num_procs]
+        all_labels = [item['label'] for item in my_configs]
+        print(f"[sweep] Assignment has {len(assignment)} total configs, my partition ({proc_idx}/{num_procs}): {len(my_configs)} configs = {all_labels}", flush=True)
 
         did_work = False
         for item in my_configs:
@@ -1285,13 +1558,36 @@ def worker_sweep(cfg, module, worker_id, tpu_name, proc_idx, num_procs):
 
             # Skip if this worker already completed it
             if label in my_done_labels:
+                print(f"[sweep] Skipping {label} (already done locally)", flush=True)
                 continue
-            if gcs_exists(f"{prefix}/done/{label}.done"):
+            done_path = f"{prefix}/done/{label}.done"
+            if gcs_exists(done_path):
+                print(f"[sweep] Skipping {label} (done receipt exists on GCS)", flush=True)
                 my_done_labels.add(label)
                 continue
 
             did_work = True
             print(f"\n[sweep] === Starting: {label} (proc {proc_idx}) ===", flush=True)
+            upload_log_tail(f"starting_{label}")
+
+            # v5e memory fix: halve batch_size, double gradient_accumulation_steps
+            # Preserves effective BS: (bs/2) * (ga*2) == bs * ga
+            accel_type = os.environ.get('ACCELERATOR_TYPE', '')
+            if 'v5' in accel_type or 'v5' in tpu_name:
+                overrides = list(overrides)  # copy to avoid mutating assignment
+                cur_bs = 8   # config.yaml default
+                cur_ga = 16  # config.yaml default
+                for o in overrides:
+                    if o.startswith('training.batch_size='):
+                        cur_bs = int(o.split('=')[1])
+                    elif o.startswith('training.gradient_accumulation_steps='):
+                        cur_ga = int(o.split('=')[1])
+                new_bs = max(1, cur_bs // 2)
+                new_ga = cur_ga * 2
+                overrides.append(f'training.batch_size={new_bs}')
+                overrides.append(f'training.gradient_accumulation_steps={new_ga}')
+                print(f"  [v5e] Memory fix: bs {cur_bs}->{new_bs}, ga {cur_ga}->{new_ga}, "
+                      f"eff_bs {cur_bs*cur_ga}->{new_bs*new_ga} (unchanged)", flush=True)
 
             # Clean slate: delete orphaned staging
             gcs_delete_prefix(f"{prefix}/results/tmp_{label}")
@@ -1315,6 +1611,8 @@ def worker_sweep(cfg, module, worker_id, tpu_name, proc_idx, num_procs):
 
             if rc == 0:
                 # Two-phase commit: upload result, then write done receipt
+                print(f"[sweep] Training done for {label}, uploading result...", flush=True)
+                write_heartbeat(prefix, worker_id, 0, label, tpu_name, status="uploading")
                 uploaded = upload_result(label, prefix, work_dir, run_name=run_name)
                 gcs_write(f"{prefix}/done/{label}.done", f"{worker_id} {time.time()}")
                 my_done_labels.add(label)
@@ -1322,19 +1620,24 @@ def worker_sweep(cfg, module, worker_id, tpu_name, proc_idx, num_procs):
                 # Clean up rolling checkpoint (free disk space)
                 cleanup_checkpoint(cfg, label, proc_idx)
 
-                status = "uploaded" if uploaded else "done (no result file found)"
-                print(f"[sweep] Completed: {label} ({status})", flush=True)
+                upload_status = "uploaded" if uploaded else "done (no result file found)"
+                print(f"[sweep] Completed: {label} ({upload_status})", flush=True)
+                upload_log_tail(f"completed_{label}")
             else:
                 print(f"[sweep] FAILED: {label} (exit code {rc})", flush=True)
+                write_heartbeat(prefix, worker_id, 0, label, tpu_name, status=f"failed_rc{rc}")
                 # Clean up checkpoint even on failure
                 cleanup_checkpoint(cfg, label, proc_idx)
                 # Still mark done (with failure) so coordinator can detect and retry
                 gcs_write(f"{prefix}/done/{label}.done", f"{worker_id} {time.time()} failed_rc{rc}")
                 my_done_labels.add(label)
+                upload_log_tail(f"failed_{label}")
 
         if not did_work:
             # All assigned configs done, wait for potential rebalanced work (Patch 1)
-            print(f"[sweep] All assigned configs done. Waiting for rebalanced work...", flush=True)
+            write_heartbeat(prefix, worker_id, 0, "idle", tpu_name, status="idle")
+            print(f"[sweep] All {len(my_configs)} assigned configs done (done_labels={my_done_labels}). Waiting for rebalanced work...", flush=True)
+            upload_log_tail("idle")
             time.sleep(60)
 
 
@@ -1355,6 +1658,14 @@ def main():
                       help='Print all configs without running')
     mode.add_argument('--preflight', action='store_true',
                       help='Run experiment preflight')
+    mode.add_argument('--enqueue', type=str, metavar='EXP_NAME',
+                      help='Add experiment to queue')
+    mode.add_argument('--dequeue', type=str, metavar='EXP_NAME',
+                      help='Remove experiment from queue')
+    mode.add_argument('--queue-status', action='store_true',
+                      help='Show experiment queue')
+    mode.add_argument('--queue-monitor', action='store_true',
+                      help='Process experiment queue (long-running)')
 
     # Worker args
     parser.add_argument('--worker-id', type=str, default=None,
@@ -1365,6 +1676,24 @@ def main():
                         help='(sweep) Total processes on this VM')
 
     args = parser.parse_args()
+
+    # Queue commands don't require EXP env var
+    if args.enqueue:
+        queue = ExperimentQueue()
+        queue.enqueue(args.enqueue)
+        return
+    elif args.dequeue:
+        queue = ExperimentQueue()
+        queue.dequeue(args.dequeue)
+        return
+    elif args.queue_status:
+        queue = ExperimentQueue()
+        queue.status_report()
+        return
+    elif args.queue_monitor:
+        queue_monitor()
+        return
+
     cfg = load_exp_config()
 
     if args.init:
