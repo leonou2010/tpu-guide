@@ -1,7 +1,7 @@
 #!/bin/bash
 # run.sh — Single command to run a full TPU experiment end-to-end.
 #
-# Usage: EXP=<name> bash ~/tpu_guide/run.sh
+# Usage: EXP=<name> bash ~/distributed_tpu_training/run.sh
 #
 # What it does:
 #   1. Acquire VMs (create up to quota in all managed zones)
@@ -12,7 +12,7 @@
 #   6. Start fleet manager (background — handles preemption, expansion, completion)
 #
 # Prerequisites:
-#   - ~/tpu_guide/experiments/${EXP}.env exists
+#   - ~/distributed_tpu_training/experiments/${EXP}.env exists
 #   - Experiment code is in place (build_configs, build_command, run_single)
 #   - GCS buckets have wheels, data, model
 
@@ -139,14 +139,14 @@ EXP=$EXP bash "$SCRIPT_DIR/submit.sh" --setup-all 2>&1 | tee -a "$LOG"
 
 log "=== Phase 3: Distributing configs ==="
 cd ~/sf_bema/experiments/$WORK_DIR
-TOTAL=$(EXP=$EXP python3 ~/tpu_guide/coordinator.py --dry-run 2>/dev/null | grep -oP '^\d+ configs' | grep -oP '^\d+' || echo 0)
+TOTAL=$(EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --dry-run 2>/dev/null | grep -oP '^\d+ configs' | grep -oP '^\d+' || echo 0)
 if [ "$TOTAL" -eq 0 ]; then
     # Fallback: count from init output
-    init_out=$(EXP=$EXP python3 ~/tpu_guide/coordinator.py --init 2>&1)
+    init_out=$(EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --init 2>&1)
     echo "$init_out" | tee -a "$LOG"
     TOTAL=$(echo "$init_out" | grep -oP '\d+ configs from' | grep -oP '^\d+' || echo 0)
 else
-    EXP=$EXP python3 ~/tpu_guide/coordinator.py --init 2>&1 | tee -a "$LOG"
+    EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --init 2>&1 | tee -a "$LOG"
 fi
 log "Total configs: $TOTAL"
 
@@ -164,11 +164,11 @@ EXP=$EXP bash "$SCRIPT_DIR/submit.sh" --sweep-all 2>&1 | tee -a "$LOG"
 log "=== Phase 5: Starting monitor + fleet manager ==="
 
 MONITOR_LOG=/tmp/monitor_${EXP}.log
-nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/tpu_guide/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
+nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/distributed_tpu_training/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
 MONITOR_PID=$!
 log "Monitor PID: $MONITOR_PID"
 
-nohup env EXP=$EXP TOTAL=$TOTAL bash ~/tpu_guide/fleet_manager.sh >> /tmp/fleet_${EXP}.log 2>&1 &
+nohup env EXP=$EXP TOTAL=$TOTAL bash ~/distributed_tpu_training/fleet_manager.sh >> /tmp/fleet_${EXP}.log 2>&1 &
 FLEET_PID=$!
 log "Fleet manager PID: $FLEET_PID"
 
@@ -177,7 +177,7 @@ log "═════════════════════════
 log "  EXPERIMENT $EXP LAUNCHED"
 log "  $vm_count VMs | $TOTAL configs | fleet manager running"
 log ""
-log "  Dashboard:     python3 ~/tpu_guide/dashboard.py --exp $EXP --interval 30"
+log "  Dashboard:     python3 ~/distributed_tpu_training/dashboard.py --exp $EXP --interval 30"
 log "  Monitor log:   tail -f $MONITOR_LOG"
 log "  Fleet log:     tail -f /tmp/fleet_${EXP}.log"
 log "  Run log:       tail -f $LOG"

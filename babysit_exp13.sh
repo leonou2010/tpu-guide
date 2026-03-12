@@ -1,7 +1,7 @@
 #!/bin/bash
 # babysit_exp13.sh — Autonomous babysitter for exp13
 # Handles: monitor keepalive, exp12_1 transition, VM recovery, result copy
-# Usage: nohup bash ~/tpu_guide/babysit_exp13.sh >> /tmp/babysit_exp13.log 2>&1 &
+# Usage: nohup bash ~/distributed_tpu_training/babysit_exp13.sh >> /tmp/babysit_exp13.log 2>&1 &
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -75,13 +75,13 @@ while true; do
   if ! pgrep -f "coordinator.*--monitor" > /dev/null 2>&1; then
     log "WARNING: exp13 monitor dead. Restarting..."
     cd ~/sf_bema/experiments/exp13_smollm2_smoltalk
-    EXP=exp13 python3 -u ~/tpu_guide/coordinator.py --monitor >> /tmp/monitor_exp13.log 2>&1 &
+    EXP=exp13 python3 -u ~/distributed_tpu_training/coordinator.py --monitor >> /tmp/monitor_exp13.log 2>&1 &
     MONITOR_PID=$!
     log "Monitor restarted (pid=$MONITOR_PID)"
   fi
 
-  # Periodic VM check — look for VMs with no active sessions
-  if [ $((RANDOM % 6)) -eq 0 ]; then  # ~1 in 6 cycles (~every 30 min)
+  # VM health check — every cycle, check for dead sessions
+  if true; then  # check every cycle (was: 1 in 6 random)
     log "--- Periodic VM health check ---"
     for cfg in "$SCRIPT_DIR"/vm_configs/*.env; do
       vm=$(basename "$cfg" .env)

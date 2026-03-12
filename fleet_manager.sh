@@ -2,7 +2,7 @@
 # fleet_manager.sh — Automated TPU VM lifecycle manager
 # Replaces babysit.sh. Runs alongside coordinator.py --monitor.
 #
-# Usage: EXP=<name> TOTAL=<N> bash ~/tpu_guide/fleet_manager.sh
+# Usage: EXP=<name> TOTAL=<N> bash ~/distributed_tpu_training/fleet_manager.sh
 #
 # Every 10 minutes:
 #   1. Check/recover dead VMs (preempted or crashed workers)
@@ -57,7 +57,7 @@ count_validated() {
 restart_monitor() {
     log "RESTARTING coordinator monitor..."
     cd ~/sf_bema/experiments/$WORK_DIR
-    nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/tpu_guide/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
+    nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/distributed_tpu_training/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
     log "New monitor PID: $!"
 }
 
@@ -129,12 +129,12 @@ create_vm() {
 setup_and_sweep() {
     local name=$1
     log "  Running setup on $name..."
-    EXP=$EXP TPU_NAME="$name" bash ~/tpu_guide/submit.sh --setup 2>&1 | tee -a "$LOG" || {
+    EXP=$EXP TPU_NAME="$name" bash ~/distributed_tpu_training/submit.sh --setup 2>&1 | tee -a "$LOG" || {
         log "  WARN: setup failed for $name"
         return 1
     }
     log "  Running sweep on $name..."
-    EXP=$EXP TPU_NAME="$name" bash ~/tpu_guide/submit.sh --sweep 2>&1 | tee -a "$LOG" || {
+    EXP=$EXP TPU_NAME="$name" bash ~/distributed_tpu_training/submit.sh --sweep 2>&1 | tee -a "$LOG" || {
         log "  WARN: sweep failed for $name"
         return 1
     }
@@ -211,7 +211,7 @@ check_dead_vms() {
             alive=$(check_workers_alive "$name" "$zone")
             if [ "$alive" = "0" ]; then
                 log "  $name: READY but workers dead. Re-sweeping..."
-                EXP=$EXP TPU_NAME="$name" bash ~/tpu_guide/submit.sh --sweep 2>&1 | tee -a "$LOG" || \
+                EXP=$EXP TPU_NAME="$name" bash ~/distributed_tpu_training/submit.sh --sweep 2>&1 | tee -a "$LOG" || \
                     log "  WARN: re-sweep failed for $name"
                 resweep=$((resweep + 1))
             else

@@ -4,16 +4,16 @@
 # Centralized push model: coordinator distributes, workers execute.
 #
 # Usage:
-#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --setup
-#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --sweep
-#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --preflight
-#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --status
-#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/tpu_guide/submit.sh --cancel
-#   EXP=exp12c bash ~/tpu_guide/submit.sh --setup-all    # iterate all vm_configs/*.env
-#   EXP=exp12c bash ~/tpu_guide/submit.sh --sweep-all
-#   EXP=exp12c bash ~/tpu_guide/submit.sh --cancel-all
-#   EXP=exp12c bash ~/tpu_guide/submit.sh --init          # distribute configs (blocklab)
-#   EXP=exp12c bash ~/tpu_guide/submit.sh --monitor       # coordination loop (blocklab)
+#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/distributed_tpu_training/submit.sh --setup
+#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/distributed_tpu_training/submit.sh --sweep
+#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/distributed_tpu_training/submit.sh --preflight
+#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/distributed_tpu_training/submit.sh --status
+#   EXP=exp12c TPU_NAME=v6e-ew4a bash ~/distributed_tpu_training/submit.sh --cancel
+#   EXP=exp12c bash ~/distributed_tpu_training/submit.sh --setup-all    # iterate all vm_configs/*.env
+#   EXP=exp12c bash ~/distributed_tpu_training/submit.sh --sweep-all
+#   EXP=exp12c bash ~/distributed_tpu_training/submit.sh --cancel-all
+#   EXP=exp12c bash ~/distributed_tpu_training/submit.sh --init          # distribute configs (blocklab)
+#   EXP=exp12c bash ~/distributed_tpu_training/submit.sh --monitor       # coordination loop (blocklab)
 
 set -euo pipefail
 
@@ -73,7 +73,7 @@ fi
 all_workers() {
   $GCLOUD alpha compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE --project=$PROJECT --tunnel-through-iap \
-    --worker=all --command="$1" 2>&1 | grep -v WARNING | grep -v tunnel | grep -v "please see"
+    --worker=all --command="$1" 2>&1 | grep -v WARNING | grep -v tunnel | grep -v "please see" || true
 }
 
 push_code() {
@@ -207,11 +207,11 @@ rm -f /tmp/ckpt_*.pt 2>/dev/null
 echo "  Cleaned \$(ls /tmp/ckpt_*.pt 2>/dev/null | wc -l) remaining checkpoint files"
 
 # Create experiments dir for coordinator config
-mkdir -p ~/tpu_guide/experiments
+mkdir -p ~/distributed_tpu_training/experiments
 
 # Copy coordinator + config into place
-cp ~/coordinator.py ~/tpu_guide/coordinator.py 2>/dev/null || true
-cp ~/experiments_\${EXP_ARG}.env ~/tpu_guide/experiments/\${EXP_ARG}.env 2>/dev/null || true
+cp ~/coordinator.py ~/distributed_tpu_training/coordinator.py 2>/dev/null || true
+cp ~/experiments_\${EXP_ARG}.env ~/distributed_tpu_training/experiments/\${EXP_ARG}.env 2>/dev/null || true
 
 # Compute this proc's global index for --proc-idx
 # proc_idx = worker_host_idx * procs_per_host + local_proc_idx
@@ -219,7 +219,7 @@ for p in \$(seq 0 \$((\$PROCS - 1))); do
   WID="\${TPUNAME}_\${WH}_\${p}"
   PROC_IDX=\$((\${WH} * \${PROCS} + \${p}))
   tmux new-session -d -s "${EXP_NAME}_\${p}" \
-    "export PATH=\$HOME/miniconda3/bin:\$HOME/.local/bin:\$PATH; export PJRT_DEVICE=TPU TPU_PROCESS_BOUNDS=1,1,1 TPU_NUM_WORKERS=1 TPU_VISIBLE_CHIPS=\${p} XLA_PERSISTENT_CACHE_PATH=/tmp/xla_cache XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache CHECKPOINT_DIR=/tmp WANDB_MODE=\${WM} MODEL_PATH=\${MDLPATH} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 BUCKET=\${BKT} LLVM_NUM_THREADS=32 EXP=\${EXP_ARG} TPU_NAME=\${TPUNAME} WORKER_IDX=\${WH} ACCELERATOR_TYPE=${ACCELERATOR_TYPE:-}; export LIBTPU_INIT_ARGS='\${LIBTPU}'; cd ~/sf_bema/experiments/\${WORKDIR} && EXP=\${EXP_ARG} python3 -u ~/tpu_guide/coordinator.py --sweep --worker-id=\${WID} --proc-idx=\${PROC_IDX} --num-procs=\${TOTAL} 2>&1 | tee /tmp/${EXP_NAME}_\${p}.log; echo SWEEP_DONE_\${p}"
+    "export PATH=\$HOME/miniconda3/bin:\$HOME/.local/bin:\$PATH; export PJRT_DEVICE=TPU TPU_PROCESS_BOUNDS=1,1,1 TPU_NUM_WORKERS=1 TPU_VISIBLE_CHIPS=\${p} XLA_PERSISTENT_CACHE_PATH=/tmp/xla_cache XLA_COMPILATION_CACHE_PATH=/tmp/xla_cache CHECKPOINT_DIR=/tmp WANDB_MODE=\${WM} MODEL_PATH=\${MDLPATH} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 BUCKET=\${BKT} LLVM_NUM_THREADS=32 EXP=\${EXP_ARG} TPU_NAME=\${TPUNAME} WORKER_IDX=\${WH} ACCELERATOR_TYPE=${ACCELERATOR_TYPE:-}; export LIBTPU_INIT_ARGS='\${LIBTPU}'; cd ~/sf_bema/experiments/\${WORKDIR} && EXP=\${EXP_ARG} python3 -u ~/distributed_tpu_training/coordinator.py --sweep --worker-id=\${WID} --proc-idx=\${PROC_IDX} --num-procs=\${TOTAL} 2>&1 | tee /tmp/${EXP_NAME}_\${p}.log; echo SWEEP_DONE_\${p}"
 done
 echo "Host \${WH}: launched \${PROCS} procs (coordinator workers)"
 LAUNCHER_HEREDOC
@@ -232,7 +232,7 @@ LAUNCHER_HEREDOC
   # Execute launcher on all workers
   all_workers "bash /tmp/tpu_launcher_${EXP_NAME}.sh $PROCS_PER_HOST $total_procs '${WANDB_MODE:-online}' '$BUCKET' '$EXP' '$TPU_NAME' '$WORK_DIR' '$MODEL_PATH' '$LIBTPU_INIT_ARGS'"
 
-  echo "[parallel] $total_procs coordinator workers launched. Monitor: EXP=$EXP bash ~/tpu_guide/monitor.sh"
+  echo "[parallel] $total_procs coordinator workers launched. Monitor: EXP=$EXP bash ~/distributed_tpu_training/monitor.sh"
 }
 
 # ── Commands ────────────────────────────────────────────────────────────────
@@ -245,8 +245,8 @@ case $MODE in
 
   --setup)
     echo "=== VM SETUP ($TPU_NUM_WORKERS workers) ==="
-    $GSUTIL cp ~/tpu_guide/secrets.env $BUCKET/config/secrets.env
-    $GSUTIL cp ~/tpu_guide/setup.sh $BUCKET/config/setup.sh
+    $GSUTIL cp ~/distributed_tpu_training/secrets.env $BUCKET/config/secrets.env
+    $GSUTIL cp ~/distributed_tpu_training/setup.sh $BUCKET/config/setup.sh
     all_workers "BUCKET=$BUCKET bash <(gsutil cat $BUCKET/config/setup.sh)"
     echo "Setup complete on all workers."
     ;;
@@ -259,7 +259,7 @@ case $MODE in
   --init)
     echo "=== INIT: Distribute configs to all VMs ==="
     cd ~/sf_bema/experiments/$WORK_DIR
-    EXP=$EXP python3 ~/tpu_guide/coordinator.py --init
+    EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --init
     ;;
 
   --preflight)
@@ -267,7 +267,7 @@ case $MODE in
     push_code
     launch_all "python3 ${EXP_MODULE//.//}.py --preflight" \
       "/tmp/${EXP_NAME}.log"
-    echo "Monitor: EXP=$EXP TPU_NAME=$TPU_NAME bash ~/tpu_guide/submit.sh --logs"
+    echo "Monitor: EXP=$EXP TPU_NAME=$TPU_NAME bash ~/distributed_tpu_training/submit.sh --logs"
     ;;
 
   --sweep)
@@ -277,10 +277,10 @@ case $MODE in
     if [ "$PROCS_PER_HOST" -gt 1 ]; then
       launch_parallel
     else
-      launch_all "mkdir -p ~/tpu_guide/experiments && cp ~/coordinator.py ~/tpu_guide/coordinator.py 2>/dev/null; cp ~/experiments_${EXP}.env ~/tpu_guide/experiments/${EXP}.env 2>/dev/null; EXP=$EXP python3 ~/tpu_guide/coordinator.py --sweep --worker-id=${TPU_NAME}_\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0)_0 --proc-idx=\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0) --num-procs=${TPU_NUM_WORKERS}; echo SWEEP_DONE" \
+      launch_all "mkdir -p ~/distributed_tpu_training/experiments && cp ~/coordinator.py ~/distributed_tpu_training/coordinator.py 2>/dev/null; cp ~/experiments_${EXP}.env ~/distributed_tpu_training/experiments/${EXP}.env 2>/dev/null; EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --sweep --worker-id=${TPU_NAME}_\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0)_0 --proc-idx=\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0) --num-procs=${TPU_NUM_WORKERS}; echo SWEEP_DONE" \
         "/tmp/${EXP_NAME}.log"
     fi
-    echo "Monitor: EXP=$EXP bash ~/tpu_guide/monitor.sh"
+    echo "Monitor: EXP=$EXP bash ~/distributed_tpu_training/monitor.sh"
     ;;
 
   --auto)
@@ -292,16 +292,16 @@ case $MODE in
       launch_all "echo auto_preflight_start && python3 ${EXP_MODULE//.//}.py --preflight && echo auto_preflight_done && { gsutil -m cp -r /tmp/xla_cache/* $BUCKET/xla_cache/ 2>/dev/null; echo XLA_CACHE_PUSHED; } && bash /tmp/tpu_launcher_${EXP_NAME}.sh $PROCS_PER_HOST $((TPU_NUM_WORKERS * PROCS_PER_HOST)) '${WANDB_MODE:-online}' '$BUCKET' '$EXP' '$TPU_NAME' '$WORK_DIR' '$MODEL_PATH' '$LIBTPU_INIT_ARGS'" \
         "/tmp/${EXP_NAME}.log"
     else
-      launch_all "echo auto_preflight_start && python3 ${EXP_MODULE//.//}.py --preflight && echo auto_preflight_done && { gsutil -m cp -r /tmp/xla_cache/* $BUCKET/xla_cache/ 2>/dev/null; echo XLA_CACHE_PUSHED; } && mkdir -p ~/tpu_guide/experiments && cp ~/coordinator.py ~/tpu_guide/coordinator.py 2>/dev/null; cp ~/experiments_${EXP}.env ~/tpu_guide/experiments/${EXP}.env 2>/dev/null; EXP=$EXP python3 ~/tpu_guide/coordinator.py --sweep --worker-id=${TPU_NAME}_\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0)_0 --proc-idx=\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0) --num-procs=${TPU_NUM_WORKERS} && echo auto_sweep_done || echo auto_FAILED" \
+      launch_all "echo auto_preflight_start && python3 ${EXP_MODULE//.//}.py --preflight && echo auto_preflight_done && { gsutil -m cp -r /tmp/xla_cache/* $BUCKET/xla_cache/ 2>/dev/null; echo XLA_CACHE_PUSHED; } && mkdir -p ~/distributed_tpu_training/experiments && cp ~/coordinator.py ~/distributed_tpu_training/coordinator.py 2>/dev/null; cp ~/experiments_${EXP}.env ~/distributed_tpu_training/experiments/${EXP}.env 2>/dev/null; EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --sweep --worker-id=${TPU_NAME}_\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0)_0 --proc-idx=\$(curl -s 'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number' -H 'Metadata-Flavor: Google' 2>/dev/null || echo 0) --num-procs=${TPU_NUM_WORKERS} && echo auto_sweep_done || echo auto_FAILED" \
         "/tmp/${EXP_NAME}.log"
     fi
-    echo "Monitor: EXP=$EXP bash ~/tpu_guide/monitor.sh"
+    echo "Monitor: EXP=$EXP bash ~/distributed_tpu_training/monitor.sh"
     ;;
 
   --monitor)
     echo "=== MONITOR: Start coordination loop ==="
     cd ~/sf_bema/experiments/$WORK_DIR
-    EXP=$EXP python3 ~/tpu_guide/coordinator.py --monitor
+    EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --monitor
     ;;
 
   --status)
@@ -313,16 +313,16 @@ case $MODE in
       ps aux | grep python3 | grep -v grep | wc -l | xargs echo 'count:'
       echo '--- last 5 log lines ---'
       tail -5 /tmp/${EXP_NAME}.log 2>/dev/null || echo 'no log yet'
-    " 2>&1 | grep -v WARNING | grep -v tunnel
+    " 2>&1 | grep -v WARNING | grep -v tunnel || true
 
     echo ""
     echo "=== COORDINATOR STATUS ==="
-    EXP=$EXP python3 ~/tpu_guide/coordinator.py --status
+    EXP=$EXP python3 ~/distributed_tpu_training/coordinator.py --status
     ;;
 
   --logs)
     echo "=== LIVE LOGS from $SSH_HOST (Ctrl+C to stop) ==="
-    ssh $SSH_HOST "tail -f /tmp/${EXP_NAME}.log" 2>&1 | grep -v WARNING | grep -v tunnel
+    ssh $SSH_HOST "tail -f /tmp/${EXP_NAME}.log" 2>&1 | grep -v WARNING | grep -v tunnel || true
     ;;
 
   --cancel)
@@ -375,7 +375,7 @@ case $MODE in
     ;;
 
   *)
-    echo "Usage: EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh <command>"
+    echo "Usage: EXP=<name> TPU_NAME=<vm> bash ~/distributed_tpu_training/submit.sh <command>"
     echo ""
     echo "Per-VM commands (require TPU_NAME):"
     echo "  --setup        Install packages, deploy code+data+model"

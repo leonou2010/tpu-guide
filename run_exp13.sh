@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_exp13.sh — Autonomous orchestrator for exp13
 # Handles: exp12_1 completion, VM setup, exp13 deploy+monitor, VM scanning
-# Usage: bash ~/tpu_guide/run_exp13.sh 2>&1 | tee /tmp/run_exp13.log
+# Usage: bash ~/distributed_tpu_training/run_exp13.sh 2>&1 | tee /tmp/run_exp13.log
 set -euo pipefail
 
 GCLOUD=~/google-cloud-sdk/bin/gcloud
@@ -28,7 +28,7 @@ if [ "$EXP12_VALIDATED" -lt 185 ]; then
     if ! pgrep -f "coordinator.*--monitor" > /dev/null 2>&1; then
       log "WARNING: exp12_1 monitor dead. Restarting..."
       cd ~/sf_bema/experiments/exp10_smollm2_smoltalk
-      EXP=exp12_1 python3 -u ~/tpu_guide/coordinator.py --monitor >> /tmp/monitor_exp12_1.log 2>&1 &
+      EXP=exp12_1 python3 -u ~/distributed_tpu_training/coordinator.py --monitor >> /tmp/monitor_exp12_1.log 2>&1 &
       log "Monitor restarted (pid=$!)"
     fi
     log "exp12_1: $EXP12_VALIDATED/185 validated. Waiting 120s..."
@@ -115,7 +115,7 @@ export EXP=exp13
 
 # Init: distribute configs to VMs
 log "Initializing exp13 (distribute configs)..."
-python3 -u ~/tpu_guide/coordinator.py --init 2>&1
+python3 -u ~/distributed_tpu_training/coordinator.py --init 2>&1
 
 # Deploy and sweep on all VMs
 log "Deploying code and starting sweep on all VMs..."
@@ -150,11 +150,11 @@ log "=== Phase 3 complete: exp13 deployed ==="
 
 # ── Phase 4: Monitor until complete ─────────────────────────────────────
 log "=== Phase 4: Monitoring exp13 (120 configs, 882 steps each) ==="
-log "Dashboard: watch -c -n30 'python3 ~/tpu_guide/dashboard.py --exp exp13'"
+log "Dashboard: watch -c -n30 'python3 ~/distributed_tpu_training/dashboard.py --exp exp13'"
 
 # Start monitor (blocks until all 120 validated)
 cd ~/sf_bema/experiments/exp13_smollm2_smoltalk
-EXP=exp13 python3 -u ~/tpu_guide/coordinator.py --monitor 2>&1 | tee -a /tmp/monitor_exp13.log
+EXP=exp13 python3 -u ~/distributed_tpu_training/coordinator.py --monitor 2>&1 | tee -a /tmp/monitor_exp13.log
 
 # ── Phase 5: Copy results ───────────────────────────────────────────────
 log "=== Phase 5: exp13 COMPLETE — copying results ==="

@@ -6,15 +6,15 @@
 #   - adamw_ema_pullback_v3_tpu Hydra config
 #
 # Usage:
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --setup
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --auto
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --preflight
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --sweep
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --status
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --logs
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --cancel
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --pull-results
-#   bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --push-code
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --setup
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --auto
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --preflight
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --sweep
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --status
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --logs
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --cancel
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --pull-results
+#   bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --push-code
 #
 # Override via env var:
 #   TPU_NAME=v5e-uc1a ZONE=us-central1-a bash submit_tpu_job_12c_v2.sh --auto
@@ -29,7 +29,7 @@ MODE=${1:---status}
 
 # Auto-source vm_config if TPU_NAME is set and config exists
 TPU_NAME=${TPU_NAME:-v5e-ew4b}
-VM_CONFIG=~/tpu_guide/vm_configs/${TPU_NAME}.env
+VM_CONFIG=~/distributed_tpu_training/vm_configs/${TPU_NAME}.env
 if [ -f "$VM_CONFIG" ]; then
   source "$VM_CONFIG"
 fi
@@ -105,7 +105,7 @@ launch_all() {
   "
   echo "Launched on all $TPU_NUM_WORKERS workers (barrier_id=$barrier_id). tmux session: $SESSION"
   echo "[xla-cache] Local path: /tmp/xla_cache → GCS: $BUCKET/xla_cache/"
-  echo "[xla-cache] After training, run: bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --push-cache"
+  echo "[xla-cache] After training, run: bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --push-cache"
 }
 
 launch_parallel() {
@@ -162,15 +162,15 @@ LAUNCHER_HEREDOC
   # Execute launcher on all workers
   all_workers "bash /tmp/tpu_launcher.sh $PROCS_PER_HOST $total_procs '${WANDB_MODE:-online}' '$BUCKET' '$LIBTPU_INIT_ARGS'"
 
-  echo "[parallel] $total_procs processes launched. Monitor: bash ~/tpu_guide/monitor_v2.sh"
+  echo "[parallel] $total_procs processes launched. Monitor: bash ~/distributed_tpu_training/monitor_v2.sh"
 }
 
 case $MODE in
 
   --setup)
     echo "=== VM SETUP ($TPU_NUM_WORKERS workers) ==="
-    $GSUTIL cp ~/tpu_guide/secrets.env $BUCKET/config/secrets.env
-    $GSUTIL cp ~/tpu_guide/setup.sh $BUCKET/config/setup.sh
+    $GSUTIL cp ~/distributed_tpu_training/secrets.env $BUCKET/config/secrets.env
+    $GSUTIL cp ~/distributed_tpu_training/setup.sh $BUCKET/config/setup.sh
     all_workers "BUCKET=$BUCKET bash <(gcloud storage cat $BUCKET/config/setup.sh)"
     echo "Setup complete on all workers."
     ;;
@@ -185,7 +185,7 @@ case $MODE in
     push_code
     launch_all "python3 exp12c_tpu/run_tpu_v2.py --preflight" \
       "/tmp/exp12c.log"
-    echo "Monitor: bash ~/tpu_guide/submit_tpu_job_12c_v2.sh --logs"
+    echo "Monitor: bash ~/distributed_tpu_training/submit_tpu_job_12c_v2.sh --logs"
     ;;
 
   --sweep)
@@ -198,7 +198,7 @@ case $MODE in
         gcloud storage cp -r outputs/ $RESULTS_GCS/${TPU_NAME}/outputs/ 2>/dev/null; echo SWEEP_DONE" \
         "/tmp/exp12c.log"
     fi
-    echo "Monitor: bash ~/tpu_guide/monitor_v2.sh"
+    echo "Monitor: bash ~/distributed_tpu_training/monitor_v2.sh"
     ;;
 
   --auto)
@@ -212,7 +212,7 @@ case $MODE in
       launch_all "echo auto_preflight_start && python3 exp12c_tpu/run_tpu_v2.py --preflight && echo auto_preflight_done && { gcloud storage cp -r /tmp/xla_cache/* $BUCKET/xla_cache/ 2>/dev/null; echo XLA_CACHE_PUSHED; } && python3 exp12c_tpu/run_tpu_v2.py --sweep && { gcloud storage cp -r outputs/ $RESULTS_GCS/${TPU_NAME}/outputs/ 2>/dev/null || true; } && echo auto_sweep_done || echo auto_FAILED" \
         "/tmp/exp12c.log"
     fi
-    echo "Monitor: bash ~/tpu_guide/monitor_v2.sh"
+    echo "Monitor: bash ~/distributed_tpu_training/monitor_v2.sh"
     ;;
 
   --status)

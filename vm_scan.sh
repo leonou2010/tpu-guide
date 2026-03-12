@@ -1,5 +1,5 @@
 #!/bin/bash
-# All-in-one TPU fleet monitor. Run: bash ~/tpu_guide/vm_scan.sh
+# All-in-one TPU fleet monitor. Run: bash ~/distributed_tpu_training/vm_scan.sh
 PROJECT=gcp-research-credits-489020
 
 # Only scan zones with quota grants (skip zones with no capacity)

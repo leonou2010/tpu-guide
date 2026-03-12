@@ -7,19 +7,19 @@
 - **Key currency**: valid result files on local disk (`~/sf_bema/results/<EXP>/validated/`).
 - **Fleet is experiment-specific.** Check `vm_scan.sh` and `vm_configs/` for current state.
 
-Full design doc: `~/tpu_guide/COORDINATOR.md`
+Full design doc: `~/distributed_tpu_training/COORDINATOR.md`
 
 ## Quick Start
 
 ```bash
 # 1. Write experiment code (build_configs, build_command, run_single, preflight)
-# 2. Create ~/tpu_guide/experiments/<exp>.env (6 lines)
+# 2. Create ~/distributed_tpu_training/experiments/<exp>.env (6 lines)
 
 # 3. Launch everything (acquires VMs, setup, init, sweep, monitor, fleet manager)
-EXP=<name> bash ~/tpu_guide/run.sh
+EXP=<name> bash ~/distributed_tpu_training/run.sh
 
 # 4. Monitor
-python3 ~/tpu_guide/dashboard.py --exp <name> --interval 30   # rich TUI
+python3 ~/distributed_tpu_training/dashboard.py --exp <name> --interval 30   # rich TUI
 tail -f /tmp/fleet_<name>.log                                   # fleet manager
 tail -f /tmp/monitor_<name>.log                                 # coordinator
 ```
@@ -28,8 +28,8 @@ run.sh handles the full lifecycle: VM acquisition → setup → config distribut
 
 For debugging a single VM:
 ```bash
-EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh --setup
-EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh --sweep
+EXP=<name> TPU_NAME=<vm> bash ~/distributed_tpu_training/submit.sh --setup
+EXP=<name> TPU_NAME=<vm> bash ~/distributed_tpu_training/submit.sh --sweep
 ```
 
 ## Commands
@@ -75,16 +75,16 @@ EXP=<name> TPU_NAME=<vm> bash ~/tpu_guide/submit.sh --sweep
 ## Monitoring
 
 ```bash
-EXP=<name> bash ~/tpu_guide/watch.sh                          # 5-min auto-refresh
-EXP=<name> python3 ~/tpu_guide/coordinator.py --status        # one-shot
-python3 ~/tpu_guide/dashboard.py --exp <name> --interval 30   # rich TUI
-bash ~/tpu_guide/vm_scan.sh                                    # fleet: VMs + quota + capacity
+EXP=<name> bash ~/distributed_tpu_training/watch.sh                          # 5-min auto-refresh
+EXP=<name> python3 ~/distributed_tpu_training/coordinator.py --status        # one-shot
+python3 ~/distributed_tpu_training/dashboard.py --exp <name> --interval 30   # rich TUI
+bash ~/distributed_tpu_training/vm_scan.sh                                    # fleet: VMs + quota + capacity
 ```
 
 ## File Layout
 
 ```
-~/tpu_guide/
+~/distributed_tpu_training/
   run.sh                # Master script — single entry point for full experiment
   fleet_manager.sh      # Automated lifecycle: preemption, expansion, completion
   coordinator.py        # Centralized push coordinator

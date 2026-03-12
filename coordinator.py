@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -47,7 +48,7 @@ def load_exp_config():
 
     candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiments', f'{exp}.env'),
-        os.path.expanduser(f'~/tpu_guide/experiments/{exp}.env'),
+        os.path.expanduser(f'~/distributed_tpu_training/experiments/{exp}.env'),
     ]
     env_file = None
     for c in candidates:
@@ -107,7 +108,7 @@ def parse_env_file(path):
 
 
 def load_vm_configs():
-    """Read all ~/tpu_guide/vm_configs/*.env, return list of dicts.
+    """Read all ~/distributed_tpu_training/vm_configs/*.env, return list of dicts.
 
     Skips VMs with PROCS_PER_HOST=0 (OOM) or unknown accelerator type.
     """
@@ -163,9 +164,10 @@ def gcs_write(path, content):
     """Write content to a GCS path via stdin pipe. Returns True on success."""
     try:
         if _use_gsutil():
+            # Use stdin piping — NOT repr(content) which produces invalid JSON
             proc = subprocess.run(
-                ['bash', '-c', f'echo {repr(content)} | gsutil cp - {path}'],
-                capture_output=True, text=True, timeout=30
+                ['gsutil', 'cp', '-', path],
+                input=content, capture_output=True, text=True, timeout=30
             )
         else:
             proc = subprocess.run(
@@ -394,9 +396,17 @@ def is_vm_dead(heartbeats):
 
     A VM with NO heartbeats is 'starting', not 'dead' — don't delete its assignment.
     Only mark dead once we've seen heartbeats that have all gone stale.
+    Grace period: if any heartbeat has status 'starting' and is less than 45 min old,
+    treat as still starting up (XLA compilation can take 10-15 min).
     """
     if not heartbeats:
         return False  # No heartbeats = hasn't started yet, not dead
+    # Grace period for VMs in startup/XLA compile phase
+    STARTUP_GRACE = 2700  # 45 min grace for XLA compilation
+    for hb in heartbeats:
+        age = time.time() - hb.get('timestamp', 0)
+        if hb.get('status') in ('starting', 'xla_compile') and age < STARTUP_GRACE:
+            return False  # Still starting up, don't mark as dead
     return all(is_stale(hb) for hb in heartbeats)
 
 
@@ -473,6 +483,11 @@ class VMState:
         self.assigned_labels = []  # Current assignment list (from GCS)
         self.is_alive = True
         self.last_refresh = 0
+
+    @staticmethod
+    def label_of(item):
+        """Extract label string from assignment item (handles both str and dict)."""
+        return item['label'] if isinstance(item, dict) else item
 
     @property
     def throughput(self):
@@ -642,7 +657,7 @@ class SweepState:
             'validated': sorted(self.validated),
             'retries': self.retries,
             'failed': sorted(self.failed),
-            'assignments': {name: [item['label'] for item in vm.assigned_labels]
+            'assignments': {name: [VMState.label_of(item) for item in vm.assigned_labels]
                             for name, vm in self.vms.items()},
             'events': self.events[-500:],  # Keep last 500 events
             'last_poll': self.last_poll_time,
@@ -656,6 +671,33 @@ class SweepState:
 
     def refresh(self):
         """Full refresh: GCS reads -> state updates -> derived computation."""
+        # 0. Reload vm_configs from disk so monitor can pick up newly created/recovered VMs.
+        # Without this, fleet expansion adds VMs that will never receive assignments.
+        try:
+            latest_vm_configs = load_vm_configs()
+        except Exception:
+            latest_vm_configs = self.vm_configs
+
+        latest_by_name = {vc.get('TPU_NAME'): vc for vc in latest_vm_configs if vc.get('TPU_NAME')}
+
+        # Add new VMs and refresh existing VM configs (bucket/zone/runtime may change).
+        for name, vc in latest_by_name.items():
+            if name not in self.vms:
+                vm = VMState(vc)
+                vm.config['STEPS_PER_CONFIG'] = self.cfg['STEPS_PER_CONFIG']
+                self.vms[name] = vm
+                self.log_event("VM_ADDED", name)
+            else:
+                self.vms[name].config.update(vc)
+
+        # Remove VMs deleted from vm_configs/ (rare, but avoids stale state).
+        for name in list(self.vms.keys()):
+            if name not in latest_by_name:
+                self.vms.pop(name, None)
+                self.log_event("VM_REMOVED", name)
+
+        self.vm_configs = latest_vm_configs
+
         # 1. Refresh each VM from GCS (batch by bucket)
         seen_buckets_hb = {}
         seen_buckets_done = {}
@@ -674,6 +716,36 @@ class SweepState:
         self.missing = self.all_labels - self.validated
         self.alive_vms = [vm for vm in self.vms.values() if vm.is_alive]
         self.dead_vms = [vm for vm in self.vms.values() if not vm.is_alive]
+
+        # 5. Ensure assignment files exist for alive VMs.
+        #
+        # If an assignment file is missing, workers immediately exit:
+        #   "[sweep] Assignment file gone. Exiting."
+        # That causes the fleet manager to repeatedly "re-sweep" without progress.
+        for vm in self.alive_vms:
+            assign_path = f"{vm.bucket}/coord/{self.exp_name}/assignments/{vm.name}.json"
+            if not gcs_exists(assign_path):
+                if gcs_write(assign_path, json.dumps([], indent=2)):
+                    vm.assigned_labels = []
+                    self.log_event("ASSIGNMENT_CREATED", vm.name)
+
+        # 6. Repair: if any missing labels are not currently assigned anywhere, append them.
+        #
+        # This prevents "tail stalls" where remaining configs become unassigned due to VM death,
+        # assignment deletion, or adding VMs mid-run.
+        assigned = set()
+        for vm in self.vms.values():
+            for item in (vm.assigned_labels or []):
+                assigned.add(VMState.label_of(item))
+        current = set()
+        for vm in self.alive_vms:
+            current |= set(vm.current_labels)
+
+        unassigned = (self.missing - self.gcs_done - self.failed) - assigned - current
+        if unassigned and self.alive_vms:
+            alive_vm_configs = [vm.config for vm in self.alive_vms]
+            self._append_to_assignments(unassigned, alive_vm_configs)
+            self.log_event("UNASSIGNED_REPAIRED", f"{len(unassigned)} labels appended")
 
         self.last_poll_time = time.time()
 
@@ -755,9 +827,9 @@ class SweepState:
             if not vm.assigned_labels:
                 continue
 
-            orphaned = [item['label'] for item in vm.assigned_labels
-                        if item['label'] not in self.validated
-                        and item['label'] not in self.gcs_done]
+            orphaned = [VMState.label_of(item) for item in vm.assigned_labels
+                        if VMState.label_of(item) not in self.validated
+                        and VMState.label_of(item) not in self.gcs_done]
 
             if orphaned and alive_vm_configs:
                 print(f"  [dead] {vm.name}: {len(orphaned)} orphaned configs -> alive VMs")
@@ -827,9 +899,9 @@ class SweepState:
             protected = assignment[:protect_count]
             movable = assignment[protect_count:]
 
-            # Filter out done items
-            protected = [item for item in protected if item['label'] not in done_labels]
-            not_done_movable = [item for item in movable if item['label'] not in done_labels]
+            # Filter out done items (handle both str and dict formats)
+            protected = [item for item in protected if VMState.label_of(item) not in done_labels]
+            not_done_movable = [item for item in movable if VMState.label_of(item) not in done_labels]
 
             vm_protected[vm.name] = protected
             pool.extend(not_done_movable)
@@ -989,7 +1061,7 @@ class SweepState:
             path = f"{vm.bucket}/coord/{self.exp_name}/assignments/{vm_name}.json"
             existing_raw = gcs_read(path)
             existing = json.loads(existing_raw) if existing_raw else []
-            existing_labels = {item['label'] for item in existing}
+            existing_labels = {VMState.label_of(item) for item in existing}
             new_items = [{'label': l, 'overrides': o} for l, o in configs
                          if l not in existing_labels]
             if new_items:
@@ -1047,8 +1119,8 @@ class SweepState:
 # ── Experiment Queue ───────────────────────────────────────────────────────
 
 class ExperimentQueue:
-    """Manages a sequential queue of experiments in ~/tpu_guide/queue.json."""
-    QUEUE_FILE = os.path.expanduser('~/tpu_guide/queue.json')
+    """Manages a sequential queue of experiments in ~/distributed_tpu_training/queue.json."""
+    QUEUE_FILE = os.path.expanduser('~/distributed_tpu_training/queue.json')
 
     def __init__(self):
         self.experiments = []
@@ -1067,7 +1139,7 @@ class ExperimentQueue:
 
     def enqueue(self, exp_name):
         # Validate experiment config exists
-        env_path = os.path.expanduser(f'~/tpu_guide/experiments/{exp_name}.env')
+        env_path = os.path.expanduser(f'~/distributed_tpu_training/experiments/{exp_name}.env')
         if not os.path.isfile(env_path):
             print(f"[queue] ERROR: experiment config not found: {env_path}", file=sys.stderr)
             sys.exit(1)
@@ -1136,7 +1208,7 @@ class ExperimentQueue:
 
 def deploy_to_fleet(exp_name, cfg, vm_configs, prev_exp=None):
     """Deploy code and launch sweep workers on all VMs."""
-    submit_sh = os.path.expanduser('~/tpu_guide/submit.sh')
+    submit_sh = os.path.expanduser('~/distributed_tpu_training/submit.sh')
     for vc in vm_configs:
         tpu_name = vc['TPU_NAME']
         env = {**os.environ}
@@ -1380,48 +1452,70 @@ def run_with_heartbeat(cmd, prefix, worker_id, label, tpu_name, log_path):
     Heartbeat only fires when training produces stdout (step-coupled).
     If training deadlocks -> no stdout -> no heartbeat -> coordinator detects.
     """
-    env = {**os.environ, 'PYTHONUNBUFFERED': '1'}  # Patch 3: force unbuffered
+    env = {**os.environ, 'PYTHONUNBUFFERED': '1'}
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env=env
+        text=True, bufsize=1, env=env,
+        preexec_fn=os.setpgrp  # new process group — killpg catches all XLA children
     )
+    # Capture pgid immediately — proc.pid may be gone by cleanup time
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        pgid = None
 
-    last_hb_time = time.time()
-    last_step = 0
+    step_ref = [0]   # mutable ref shared with heartbeat thread
+    captured_run_name = None
     step_re = re.compile(r'step (\d+)/')
     done_re = re.compile(r'^DONE: (.+)$')
-    captured_run_name = None
 
-    # Write initial heartbeat with "xla_compile" status
-    write_heartbeat(prefix, worker_id, 0, label, tpu_name, status="xla_compile")
+    # Background heartbeat thread — decoupled from stdout so silent training doesn't stale out
+    hb_stop = threading.Event()
+    def _hb_loop():
+        write_heartbeat(prefix, worker_id, 0, label, tpu_name, status="xla_compile")
+        while not hb_stop.is_set():
+            hb_stop.wait(HEARTBEAT_INTERVAL)
+            if hb_stop.is_set():
+                break
+            status = "training" if step_ref[0] > 0 else "xla_compile"
+            try:
+                write_heartbeat(prefix, worker_id, step_ref[0], label, tpu_name, status=status)
+            except Exception:
+                pass
+    hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    hb_thread.start()
 
     with open(log_path, 'w') as log:
-        for line in iter(proc.stdout.readline, ''):  # Patch 3: reliable pipe reading
+        for line in iter(proc.stdout.readline, ''):
             print(line, end='', flush=True)
             log.write(line)
 
             m = step_re.search(line)
             if m:
                 new_step = int(m.group(1))
-                if new_step > 0 and last_step == 0:
-                    # First real step — XLA compile done, now training
+                if new_step > 0 and step_ref[0] == 0:
+                    # First real step — XLA compile done
                     write_heartbeat(prefix, worker_id, new_step, label, tpu_name, status="training")
-                last_step = new_step
+                step_ref[0] = new_step
 
-            # Capture run_name from training script's "DONE: <run_name>" output
             dm = done_re.search(line.strip())
             if dm:
                 captured_run_name = dm.group(1).strip()
 
-            if time.time() - last_hb_time > HEARTBEAT_INTERVAL:
-                status = "training" if last_step > 0 else "xla_compile"
-                write_heartbeat(prefix, worker_id, last_step, label, tpu_name, status=status)
-                last_hb_time = time.time()
-
+    hb_stop.set()
+    hb_thread.join(timeout=5)
     proc.wait()
 
-    # Final heartbeat with exit info
-    write_heartbeat(prefix, worker_id, last_step, label, tpu_name)
+    # Kill entire process group — catches orphaned torch_xla children
+    import signal as _signal
+    if pgid is not None:
+        try:
+            os.killpg(pgid, _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Final heartbeat
+    write_heartbeat(prefix, worker_id, step_ref[0], label, tpu_name)
     return proc.returncode, captured_run_name
 
 

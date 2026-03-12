@@ -17,7 +17,7 @@ log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 restart_monitor() {
     log "RESTARTING coordinator monitor..."
     cd ~/sf_bema/experiments/exp10_smollm2_smoltalk
-    nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/tpu_guide/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
+    nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/distributed_tpu_training/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
     log "New monitor PID: $!"
 }
 

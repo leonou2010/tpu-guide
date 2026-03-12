@@ -2,20 +2,20 @@
 # xla_cache_sync.sh — Sync XLA compilation cache between VMs, GCS, and local server
 #
 # Usage:
-#   bash ~/tpu_guide/xla_cache_sync.sh --pull-vm   TPU_NAME ZONE CHIP_FAMILY
-#   bash ~/tpu_guide/xla_cache_sync.sh --push-vm   TPU_NAME ZONE CHIP_FAMILY
-#   bash ~/tpu_guide/xla_cache_sync.sh --pull-gcs   CHIP_FAMILY
-#   bash ~/tpu_guide/xla_cache_sync.sh --push-gcs   CHIP_FAMILY
-#   bash ~/tpu_guide/xla_cache_sync.sh --status
+#   bash ~/distributed_tpu_training/xla_cache_sync.sh --pull-vm   TPU_NAME ZONE CHIP_FAMILY
+#   bash ~/distributed_tpu_training/xla_cache_sync.sh --push-vm   TPU_NAME ZONE CHIP_FAMILY
+#   bash ~/distributed_tpu_training/xla_cache_sync.sh --pull-gcs   CHIP_FAMILY
+#   bash ~/distributed_tpu_training/xla_cache_sync.sh --push-gcs   CHIP_FAMILY
+#   bash ~/distributed_tpu_training/xla_cache_sync.sh --status
 #
-# Local cache: ~/tpu_guide/xla_cache/{v4,v5e,v6e}/
+# Local cache: ~/distributed_tpu_training/xla_cache/{v4,v5e,v6e}/
 # GCS cache:   gs://<bucket>/xla_cache/
 # VM cache:    /tmp/xla_cache/
 
 GCLOUD=~/google-cloud-sdk/bin/gcloud
 GSUTIL=~/google-cloud-sdk/bin/gsutil
 PROJECT=gcp-research-credits-489020
-LOCAL_CACHE=~/tpu_guide/xla_cache
+LOCAL_CACHE=~/distributed_tpu_training/xla_cache
 
 # Chip family → GCS buckets (all buckets that have this chip family)
 declare -A CHIP_BUCKETS

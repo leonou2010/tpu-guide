@@ -1,6 +1,6 @@
 #!/bin/bash
 # Generic overnight babysitter
-# Usage: EXP=<name> TOTAL=<N> bash ~/tpu_guide/babysit.sh
+# Usage: EXP=<name> TOTAL=<N> bash ~/distributed_tpu_training/babysit.sh
 # Checks every 10 min: monitor alive? results accumulating?
 # When done: copies results to exp folder.
 
@@ -10,7 +10,7 @@ EXP=${EXP:?'EXP required'}
 TOTAL=${TOTAL:?'TOTAL required (number of configs)'}
 
 # Load experiment config for WORK_DIR
-source ~/tpu_guide/experiments/${EXP}.env
+source ~/distributed_tpu_training/experiments/${EXP}.env
 
 RESULTS_DIR=~/sf_bema/results/$EXP/validated
 EXP_DIR=~/sf_bema/experiments/$WORK_DIR/${EXP}_tpu
@@ -22,7 +22,7 @@ log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 restart_monitor() {
     log "RESTARTING coordinator monitor..."
     cd ~/sf_bema/experiments/$WORK_DIR
-    nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/tpu_guide/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
+    nohup env EXP=$EXP PYTHONUNBUFFERED=1 python3 -u ~/distributed_tpu_training/coordinator.py --monitor >> "$MONITOR_LOG" 2>&1 &
     log "New monitor PID: $!"
 }
 

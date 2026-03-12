@@ -58,8 +58,10 @@ rm -rf /tmp/tpu_wheels /tmp/tpu_wheels.tar.gz
 # Install deps missing from wheels bundle (--no-deps skips them)
 # Try pip install first (internet VMs), fall back to pre-built wheels on GCS (no-internet VMs)
 pip3 install 'antlr4-python3-runtime==4.9.3' -q 2>/dev/null || {
-  gsutil cp $BUCKET/wheels/antlr4_python3_runtime-4.9.3-py3-none-any.whl /tmp/antlr4_python3_runtime-4.9.3-py3-none-any.whl 2>/dev/null && \
-  pip3 install /tmp/antlr4_python3_runtime-4.9.3-py3-none-any.whl -q 2>/dev/null || true
+  gsutil cp $BUCKET/wheels/antlr4_python3_runtime-4.9.3-py3-none-any.whl /tmp/ 2>/dev/null && \
+  pip3 install /tmp/antlr4_python3_runtime-4.9.3-py3-none-any.whl -q 2>/dev/null || \
+  gcloud storage cp $BUCKET/wheels/antlr4-python3-runtime-4.9.3.tar.gz /tmp/ 2>/dev/null && \
+  pip3 install /tmp/antlr4-python3-runtime-4.9.3.tar.gz -q 2>/dev/null || true
 }
 pip3 install 'typing_extensions>=4.0' -q 2>/dev/null || {
   gsutil cp $BUCKET/wheels/typing_extensions*.whl /tmp/ 2>/dev/null && \
@@ -68,6 +70,10 @@ pip3 install 'typing_extensions>=4.0' -q 2>/dev/null || {
 pip3 install 'numpy<2' -q 2>/dev/null || {
   gsutil cp $BUCKET/wheels/numpy-*.whl /tmp/ 2>/dev/null && \
   pip3 install /tmp/numpy-*.whl -q 2>/dev/null || true
+}
+pip3 install sympy mpmath -q 2>/dev/null || {
+  gsutil cp $BUCKET/wheels/sympy-*.whl $BUCKET/wheels/mpmath-*.whl /tmp/ 2>/dev/null && \
+  pip3 install /tmp/mpmath-*.whl /tmp/sympy-*.whl -q 2>/dev/null || true
 }
 
 echo "[5/9] Logging into W&B..."

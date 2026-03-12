@@ -1,7 +1,7 @@
 #!/bin/bash
 # vm_scanner.sh — Periodically scan for new/recreated VMs and add them to the running experiment
 # Runs alongside the main orchestrator. Creates VM configs for new VMs, sets them up, deploys sweep.
-# Usage: EXP=exp13 bash ~/tpu_guide/vm_scanner.sh 2>&1 | tee /tmp/vm_scanner.log
+# Usage: EXP=exp13 bash ~/distributed_tpu_training/vm_scanner.sh 2>&1 | tee /tmp/vm_scanner.log
 set -uo pipefail
 
 GCLOUD=~/google-cloud-sdk/bin/gcloud
@@ -19,27 +19,46 @@ declare -A ZONE_TYPE=(
   [us-east1-d]="v6e"
   [us-central2-b]="v4"
   [europe-west4-b]="v5e"
+  [us-central1-a]="v5e"
 )
 declare -A ZONE_BUCKET=(
   [europe-west4-a]="gs://gcp-researchcredits-blocklab-europe-west4"
   [us-east1-d]="gs://gcp-researchcredits-blocklab-us-east1"
   [us-central2-b]="gs://gcp-researchcredits-blocklab-1-us-central2"
   [europe-west4-b]="gs://gcp-researchcredits-blocklab-europe-west4"
+  [us-central1-a]="gs://gcp-researchcredits-blocklab-europe-west4"
 )
 declare -A ZONE_WANDB=(
   [europe-west4-a]="online"
   [us-east1-d]="disabled"
   [us-central2-b]="disabled"
   [europe-west4-b]="online"
+  [us-central1-a]="online"
 )
 declare -A ZONE_RUNTIME=(
   [europe-west4-a]="v2-alpha-tpuv6e"
   [us-east1-d]="v2-alpha-tpuv6e"
   [us-central2-b]="tpu-ubuntu2204-base"
   [europe-west4-b]="v2-alpha-tpuv5-lite"
+  [us-central1-a]="v2-alpha-tpuv5-lite"
 )
 
-ZONES="europe-west4-a us-east1-d us-central2-b europe-west4-b"
+declare -A ZONE_ACCEL=(
+  [europe-west4-a]="v6e-8"
+  [us-east1-d]="v6e-8"
+  [us-central2-b]="v4-8"
+  [europe-west4-b]="v5litepod-4"
+  [us-central1-a]="v5litepod-4"
+)
+declare -A ZONE_MAX_CHIPS=(
+  [europe-west4-a]=64
+  [us-east1-d]=64
+  [us-central2-b]=64
+  [europe-west4-b]=64
+  [us-central1-a]=64
+)
+
+ZONES="europe-west4-a us-east1-d us-central2-b europe-west4-b us-central1-a"
 
 create_vm_config() {
   local name=$1 zone=$2 accel=$3
@@ -138,27 +157,94 @@ while true; do
         source "$cfg_file"
         PPH=${PROCS_PER_HOST:-0}
         if [ "$PPH" -gt 0 ]; then
-          # Quick liveness check via heartbeat age would be ideal,
-          # but for now just check if tmux sessions exist
-          HAS_SESSIONS=$($GCLOUD alpha compute tpus tpu-vm ssh "$name" \
+          # Check for ANY active tmux sessions (don't kill other experiments)
+          ALL_SESSIONS=$($GCLOUD alpha compute tpus tpu-vm ssh "$name" \
             --zone="$zone" --project=$PROJECT --tunnel-through-iap \
-            --command="tmux list-sessions 2>/dev/null | grep -c '${EXP}' || echo 0" 2>&1 | grep -oE '[0-9]+' | tail -1 || echo 0)
+            --command="tmux list-sessions 2>/dev/null | wc -l || echo 0" 2>&1 | grep -oE '[0-9]+' | tail -1 || echo 0)
 
-          if [ "${HAS_SESSIONS:-0}" -eq 0 ]; then
-            log "  $name: READY but no active sessions — re-deploying..."
+          if [ "${ALL_SESSIONS:-0}" -eq 0 ]; then
+            log "  $name: READY, no sessions at all — deploying $EXP..."
             setup_and_deploy "$name" || true
             NEW_VMS=$((NEW_VMS + 1))
+          else
+            # Has sessions — check if they're for OUR experiment
+            OUR_SESSIONS=$($GCLOUD alpha compute tpus tpu-vm ssh "$name" \
+              --zone="$zone" --project=$PROJECT --tunnel-through-iap \
+              --command="tmux list-sessions 2>/dev/null | grep -c '${EXP}' || echo 0" 2>&1 | grep -oE '[0-9]+' | tail -1 || echo 0)
+            if [ "${OUR_SESSIONS:-0}" -eq 0 ]; then
+              log "  $name: has sessions from another experiment — skipping (let babysitter handle transition)"
+            fi
           fi
         fi
       fi
     done <<< "$VMS"
   done
 
+  # --- Phase 2: Try to create new VMs in zones with spare quota ---
+  log "--- Trying to expand fleet ---"
+  for zone in $ZONES; do
+    accel=${ZONE_ACCEL[$zone]:-""}
+    [ -z "$accel" ] && continue
+    max_chips=${ZONE_MAX_CHIPS[$zone]:-64}
+    runtime=${ZONE_RUNTIME[$zone]:-""}
+    chip_per_vm=8
+    if [[ "$accel" == *"v5litepod-4"* ]]; then
+      chip_per_vm=4
+    fi
+
+    # Count current chips in zone
+    CURRENT=$($GCLOUD alpha compute tpus tpu-vm list \
+      --zone="$zone" --project=$PROJECT \
+      --format='csv[no-heading](acceleratorType)' 2>/dev/null | while read a; do
+        echo "$a" | grep -oP '\d+$'
+      done | paste -sd+ | bc 2>/dev/null || echo 0)
+    CURRENT=${CURRENT:-0}
+
+    REMAINING=$((max_chips - CURRENT))
+    if [ "$REMAINING" -lt "$chip_per_vm" ]; then
+      continue  # zone full
+    fi
+
+    # How many VMs can we create?
+    NUM_NEW=$((REMAINING / chip_per_vm))
+    [ "$NUM_NEW" -gt 3 ] && NUM_NEW=3  # max 3 per cycle to avoid hammering API
+
+    log "  $zone: ${CURRENT}/${max_chips} chips, trying $NUM_NEW new VMs..."
+
+    for i in $(seq 1 $NUM_NEW); do
+      # Generate unique name
+      PREFIX="${ZONE_TYPE[$zone]}-$(echo $zone | sed 's/[^a-z0-9]//g' | head -c8)"
+      # Find next available number
+      EXISTING=$($GCLOUD alpha compute tpus tpu-vm list \
+        --zone="$zone" --project=$PROJECT \
+        --format='value(name)' 2>/dev/null || true)
+      for n in $(seq 1 99); do
+        CANDIDATE="${ZONE_TYPE[$zone]}-$(echo $zone | cut -d- -f1-2 | head -c3)$(echo $zone | grep -oP '\d+[a-z]$')-${n}"
+        # Make more readable names
+        case "$zone" in
+          europe-west4-a) CANDIDATE="v6e-ew4a-${n}" ;;
+          us-east1-d)     CANDIDATE="v6e-ue1d-${n}" ;;
+          us-central2-b)  CANDIDATE="v4-uc2b-${n}" ;;
+          europe-west4-b) CANDIDATE="v5e-ew4b-${n}" ;;
+          us-central1-a)  CANDIDATE="v5e-uc1a-${n}" ;;
+        esac
+        if ! echo "$EXISTING" | grep -qx "$CANDIDATE"; then
+          break
+        fi
+      done
+
+      log "  Creating $CANDIDATE ($accel) in $zone..."
+      $GCLOUD alpha compute tpus tpu-vm create "$CANDIDATE" \
+        --zone="$zone" --project=$PROJECT \
+        --accelerator-type="$accel" --version="$runtime" --spot --internal-ips 2>&1 | tail -2 &
+    done
+    wait  # wait for all creates in this zone
+  done
+
   if [ "$NEW_VMS" -gt 0 ]; then
     log "Scan complete: $NEW_VMS VMs (re)deployed"
-    # Re-init coordinator to include new VMs in distribution
-    cd ~/sf_bema/experiments/$(grep WORK_DIR "$SCRIPT_DIR/experiments/${EXP}.env" | cut -d= -f2)
-    EXP=$EXP python3 ~/tpu_guide/coordinator.py --init 2>&1 | tail -3
+    # NOTE: Do NOT run --init here — it clears heartbeats and done receipts!
+    # New VMs will pick up work from existing assignments via the coordinator.
   else
     log "Scan complete: no changes"
   fi

@@ -2,7 +2,7 @@
 """
 TPU Fleet Dashboard — rich-based terminal UI.
 
-Single command: python3 ~/tpu_guide/dashboard.py [--exp EXP_NAME]
+Single command: python3 ~/distributed_tpu_training/dashboard.py [--exp EXP_NAME]
 Shows: fleet status, zone capacity, experiment progress, per-VM workers, phase tracking.
 Auto-refreshes every 60s.
 """
@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
@@ -31,7 +31,7 @@ except ImportError:
 
 GCLOUD = os.path.expanduser("~/google-cloud-sdk/bin/gcloud")
 PROJECT = "gcp-research-credits-489020"
-TPU_GUIDE = os.path.expanduser("~/tpu_guide")
+TPU_GUIDE = os.path.expanduser("~/distributed_tpu_training")
 RESULTS_BASE = os.path.expanduser("~/sf_bema/results")
 
 # Per-zone quota grants
@@ -297,92 +297,101 @@ def query_vm_gcs(vm_cfg, exp_name):
 
 
 def build_vm_detail_table(vm_configs, exp_name, steps_per_config):
-    """Build per-VM detail table with live SSH + GCS data (parallel queries)."""
+    """Build per-VM table with heartbeat status + GCS done/assigned counts."""
     import concurrent.futures
 
     if not vm_configs or not exp_name:
-        return Panel("[dim]No VM configs found. Create vm_configs/*.env for READY VMs.[/dim]",
-                     title="Per-VM Workers", border_style="magenta")
+        return Panel("[dim]No VMs[/dim]", title="Workers", border_style="magenta")
 
-    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold magenta",
-                  show_lines=False, padding=(0, 1))
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold magenta",
+                  show_lines=False, padding=(0, 0))
     table.add_column("VM", style="bold", no_wrap=True)
-    table.add_column("Chips", justify="right")
+    table.add_column("Type", no_wrap=True)
     table.add_column("Status", no_wrap=True)
     table.add_column("Step", justify="right", no_wrap=True)
-    table.add_column("Train", justify="right")
-    table.add_column("Best", justify="right")
-    table.add_column("ETA", justify="right")
+    table.add_column("Hb", justify="right", no_wrap=True)
     table.add_column("D/A", justify="right", no_wrap=True)
-    table.add_column("cfg/h", justify="right")
 
-    # Parallel SSH + GCS queries
-    ssh_results = {}
+    # Parallel queries: heartbeat + GCS assignment
+    hb_results = {}
     gcs_results = {}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        ssh_futures = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        hb_futures = {}
         gcs_futures = {}
         for cfg in vm_configs:
             tpu = cfg.get("TPU_NAME", "")
             pph = int(cfg.get("PROCS_PER_HOST", "0"))
             if pph == 0:
                 continue
-            ssh_futures[tpu] = pool.submit(query_vm_live, cfg, exp_name)
+            hb_futures[tpu] = pool.submit(query_vm_live, cfg, exp_name)
             gcs_futures[tpu] = pool.submit(query_vm_gcs, cfg, exp_name)
-
-        for tpu, fut in ssh_futures.items():
+        for tpu, fut in hb_futures.items():
             try:
-                ssh_results[tpu] = fut.result(timeout=50)
+                hb_results[tpu] = fut.result(timeout=50)
             except Exception:
-                ssh_results[tpu] = {"status": "TIMEOUT", "color": "red"}
-
+                hb_results[tpu] = {"status": "TIMEOUT", "color": "red"}
         for tpu, fut in gcs_futures.items():
             try:
                 gcs_results[tpu] = fut.result(timeout=20)
             except Exception:
                 gcs_results[tpu] = {"gcs_done": 0, "gcs_assigned": 0}
 
+    # Aggregate stats
+    total_running = 0
+    total_stuck = 0
+    total_done_all = 0
+    total_assigned_all = 0
+
+    rows = []
     for cfg in vm_configs:
         tpu = cfg.get("TPU_NAME", "")
         accel = cfg.get("ACCELERATOR_TYPE", "")
         pph = int(cfg.get("PROCS_PER_HOST", "0"))
-        hosts = int(cfg.get("TPU_NUM_WORKERS", "1"))
-        chips = int(re.search(r"(\d+)$", accel).group(1)) if re.search(r"(\d+)$", accel) else 0
-
         if pph == 0:
-            table.add_row(tpu, str(chips), "[red]OOM[/red]", "—", "—", "—", "—", "—", "—")
             continue
-
-        procs = hosts * pph
-        chip_type = re.match(r"(v\w+)-", accel)
-        chip_type = chip_type.group(1) if chip_type else "v6e"
-        step_s = CHIP_SPECS.get(chip_type, {}).get("step_s", 5.0)
-        cfg_h = steps_per_config * step_s / 3600
-        tput = f"{procs / cfg_h:.1f} cfg/h"
-
-        live = ssh_results.get(tpu, {})
         gcs = gcs_results.get(tpu, {})
-
-        status_str = f"[{live.get('color', 'dim')}]{live.get('status', '?')}[/{live.get('color', 'dim')}]"
-        step_str = f"{live.get('step', '—')}/{steps_per_config}" if live.get('step', 0) > 0 else "—"
-
         gcs_done = gcs.get('gcs_done', 0)
         gcs_assigned = gcs.get('gcs_assigned', 0)
-        done_asgn = f"{gcs_done}/{gcs_assigned}"
+        if gcs_assigned == 0:
+            continue  # skip VMs with no work
 
-        table.add_row(
-            tpu, str(chips),
-            status_str,
-            step_str,
-            str(live.get("train_loss", "—")),
-            str(live.get("best_val", "—")),
-            str(live.get("time_left", "—")),
-            done_asgn,
-            tput,
-        )
+        live = hb_results.get(tpu, {})
+        status = live.get('status', '?')
+        color = live.get('color', 'dim')
+        status_str = f"[{color}]{status}[/{color}]"
+        cur_step = live.get('step', 0)
+        step_str = f"{cur_step}/{steps_per_config}" if cur_step > 0 else "—"
+        hb_age = live.get('time_left', '—')
+        chip_type = re.match(r"(v\w+)", accel)
+        chip_type = chip_type.group(1) if chip_type else "?"
 
-    return Panel(table, title="Per-VM Workers", border_style="magenta")
+        # Aggregate
+        total_assigned_all += gcs_assigned
+        total_done_all += gcs_done
+        if status == "RUNNING":
+            total_running += 1
+        elif "STUCK" in status or status == "DEAD":
+            total_stuck += 1
+
+        rows.append((tpu, chip_type, status_str, step_str, hb_age, f"{gcs_done}/{gcs_assigned}"))
+
+    for row in rows:
+        table.add_row(*row)
+
+    # Summary line
+    vm_count = len(rows)
+    summary = Text()
+    summary.append(f"  {vm_count} VMs", style="bold")
+    summary.append(f" | ")
+    summary.append(f"{total_running} running", style="green")
+    if total_stuck > 0:
+        summary.append(f" | ")
+        summary.append(f"{total_stuck} stuck", style="red")
+    summary.append(f" | done {total_done_all}/{total_assigned_all}")
+
+    if rows:
+        return Panel(Group(summary, table), title="Workers", border_style="magenta")
+    return Panel(summary, title="Workers", border_style="magenta")
 
 
 def detect_phase(vms, vm_configs, exp_name, validated, total):
@@ -541,21 +550,13 @@ def build_experiment_panel(exp_name, exp_cfg, validated, total, state, vm_config
         eta_str, total_tput = compute_fleet_eta(vm_configs, exp_cfg, total, validated)
         lines.append(f"  Fleet:    {total_tput:.1f} cfg/h  │  ETA: [bold]{eta_str}[/bold]")
 
-    lines.append("")
-
-    # Per-VM assignments (only show VMs with >0 configs)
+    # Assignment summary (one line)
     if assignments:
-        active_assignments = {vm: labels for vm, labels in sorted(assignments.items())
-                              if (len(labels) if isinstance(labels, list) else labels) > 0}
-        if active_assignments:
-            lines.append("  [bold]Assignments:[/bold]")
-            for vm, labels in sorted(active_assignments.items()):
-                count = len(labels) if isinstance(labels, list) else labels
-                lines.append(f"    {vm}: {count} configs")
-        else:
-            lines.append("  [dim]All assignments completed[/dim]")
+        active_vms = sum(1 for v, l in assignments.items() if (len(l) if isinstance(l, list) else l) > 0)
+        total_assigned = sum(len(l) if isinstance(l, list) else l for l in assignments.values())
+        lines.append(f"  VMs: {active_vms} active  │  Assigned: {total_assigned} configs")
     else:
-        lines.append("  [dim]No assignments yet (run coordinator --init)[/dim]")
+        lines.append("  [dim]No assignments (run coordinator --init)[/dim]")
 
     return Panel("\n".join(lines), title="Experiment", border_style="blue")
 
@@ -596,16 +597,16 @@ def build_actions_panel(phase, exp_name, vm_configs, vms):
     elif phase == "SETUP NEEDED":
         lines.append("[yellow]VMs are READY. Create vm_configs and run setup:[/yellow]")
         for vm in ready_vms:
-            lines.append(f"  EXP={exp_name} TPU_NAME={vm['name']} bash ~/tpu_guide/submit.sh --setup")
+            lines.append(f"  EXP={exp_name} TPU_NAME={vm['name']} bash ~/distributed_tpu_training/submit.sh --setup")
 
     elif phase == "INIT NEEDED":
         lines.append("[yellow]Run coordinator init to distribute configs:[/yellow]")
-        lines.append(f"  EXP={exp_name} python3 ~/tpu_guide/coordinator.py --init")
+        lines.append(f"  EXP={exp_name} python3 ~/distributed_tpu_training/coordinator.py --init")
 
     elif phase in ("SWEEPING", "MONITORING"):
         lines.append("[green]Sweep is running. Monitor with:[/green]")
-        lines.append(f"  EXP={exp_name} bash ~/tpu_guide/watch.sh")
-        lines.append(f"  EXP={exp_name} python3 ~/tpu_guide/coordinator.py --status")
+        lines.append(f"  EXP={exp_name} bash ~/distributed_tpu_training/watch.sh")
+        lines.append(f"  EXP={exp_name} python3 ~/distributed_tpu_training/coordinator.py --status")
 
     elif phase == "DONE":
         lines.append("[green bold]All configs validated! Pull results:[/green bold]")
@@ -618,54 +619,22 @@ def build_actions_panel(phase, exp_name, vm_configs, vms):
 
 
 def build_automation_panel():
-    """Show babysitter/monitor process status and next scheduled actions."""
-    lines = []
+    """Show babysitter/monitor process status."""
+    parts = []
 
-    # Check babysitter processes
-    try:
-        r = subprocess.run("ps aux | grep 'babysit_exp' | grep -v grep", shell=True,
-                          capture_output=True, text=True, timeout=5)
-        babysit_lines = [l for l in r.stdout.strip().split("\n") if l.strip()]
-        if babysit_lines:
-            for bl in babysit_lines:
-                parts = bl.split()
-                pid = parts[1]
-                # Extract exp name from command
-                exp_match = re.search(r'babysit_(\w+)', bl)
-                exp_id = exp_match.group(1) if exp_match else "?"
-                lines.append(f"  [green]babysit_{exp_id}[/green] PID={pid}")
+    # Use pgrep for reliable detection (works inside watch)
+    for label, pattern in [("babysit", "babysit_exp"), ("monitor", "coordinator.*--monitor"), ("scanner", "vm_scanner")]:
+        try:
+            r = subprocess.run(f"pgrep -c -f '{pattern}'", shell=True, capture_output=True, text=True, timeout=5)
+            count = int(r.stdout.strip()) if r.returncode == 0 else 0
+        except Exception:
+            count = 0
+        if count > 0:
+            parts.append(f"[green]{label}×{count}[/green]")
         else:
-            lines.append("  [red]No babysitter running[/red]")
-    except Exception:
-        lines.append("  [dim]Could not check babysitter[/dim]")
+            parts.append(f"[red]{label}:OFF[/red]")
 
-    # Check monitor processes
-    try:
-        r = subprocess.run("ps aux | grep 'coordinator.py --monitor' | grep -v grep", shell=True,
-                          capture_output=True, text=True, timeout=5)
-        mon_lines = [l for l in r.stdout.strip().split("\n") if l.strip()]
-        if mon_lines:
-            lines.append(f"  [green]monitor[/green] × {len(mon_lines)} process(es)")
-        else:
-            lines.append("  [red]No monitor running[/red]")
-    except Exception:
-        lines.append("  [dim]Could not check monitor[/dim]")
-
-    # Babysitter cycle info
-    lines.append("")
-    lines.append("  [dim]Babysitter: checks every 5min, VM health every ~30min[/dim]")
-    lines.append("  [dim]Monitor: pulls GCS results every ~60s[/dim]")
-
-    # Check for VM scanner
-    try:
-        r = subprocess.run("ps aux | grep 'vm_scanner' | grep -v grep", shell=True,
-                          capture_output=True, text=True, timeout=5)
-        if r.stdout.strip():
-            lines.append("  [green]VM scanner running[/green]")
-    except Exception:
-        pass
-
-    return Panel("\n".join(lines), title="Automation", border_style="green")
+    return Panel("  ".join(parts), title="Automation", border_style="green")
 
 
 def build_dashboard(exp_name=None):
@@ -737,6 +706,7 @@ def main():
     parser.add_argument("--exp", default=None, nargs='+', help="Experiment name(s) (e.g., exp12_1 exp13)")
     parser.add_argument("--once", action="store_true", help="Print once and exit (no live refresh)")
     parser.add_argument("--interval", type=int, default=60, help="Refresh interval in seconds")
+    parser.add_argument("--pager", action="store_true", help="Use scrollable pager (less) for output")
     args = parser.parse_args()
 
     # Auto-detect experiment from EXP env var
@@ -749,30 +719,31 @@ def main():
     console = Console(force_terminal=True)
 
     def render_all(target_console):
-        """Render fleet once, then each experiment's panels."""
-        # --- Shared fleet section (once) ---
+        """Render full dashboard: header, fleet, quota, automation, per-experiment panels."""
         vms = scan_vms()
         vm_configs = load_vm_configs()
 
+        ready_count = sum(1 for v in vms if v["state"] == "READY")
         ready_chips = sum(v["chips"] for v in vms if v["state"] == "READY")
-        creating_chips = sum(v["chips"] for v in vms if v["state"] == "CREATING")
+        creating_count = sum(1 for v in vms if v["state"] == "CREATING")
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header = Text()
         header.append("  TPU Fleet Dashboard", style="bold white")
         header.append(f"  │  {now}  │  ", style="dim")
-        header.append(f"{ready_chips} READY", style="bold green")
-        header.append(" + ", style="dim")
-        header.append(f"{creating_chips} CREATING", style="bold yellow")
-        header.append(" chips", style="dim")
+        header.append(f"{ready_count} VMs ({ready_chips} chips) READY", style="bold green")
+        if creating_count:
+            header.append(f" + {creating_count} CREATING", style="yellow")
         exp_list = ", ".join(n for n in exp_names if n)
         if exp_list:
             header.append(f"  │  ", style="dim")
             header.append(exp_list, style="bold cyan")
         target_console.print(Panel(header, box=box.DOUBLE))
 
-        # Fleet + Quota
+        # Fleet status
         target_console.print(Panel(build_fleet_table(vms), title="Fleet Status", border_style="cyan"))
+
+        # Quota usage
         target_console.print(Panel(build_quota_table(vms), title="Quota Usage", border_style="dim"))
 
         # Automation status
@@ -788,9 +759,6 @@ def main():
             state = get_state(en)
             wandb_info = get_wandb_info(exp_cfg) if exp_cfg else (None, None)
 
-            # Phase (per-experiment)
-            phase, detail, color = detect_phase(vms, vm_configs, en, validated, total)
-
             target_console.print(build_experiment_panel(en, exp_cfg, validated, total, state, vm_configs, wandb_info))
 
             # Per-VM workers — only show VMs assigned to this experiment
@@ -805,7 +773,11 @@ def main():
                     target_console.print(build_vm_detail_table(filtered_configs, en, steps))
 
     if args.once:
-        render_all(console)
+        if args.pager:
+            with console.pager(styles=True):
+                render_all(console)
+        else:
+            render_all(console)
         return
 
     # Refresh mode

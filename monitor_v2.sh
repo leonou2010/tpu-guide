@@ -208,4 +208,4 @@ for vm_line in "${VMS[@]}"; do
 done
 
 rm -rf "$tmpdir"
-echo -e "${D}Auto-refresh: bash ~/tpu_guide/watch.sh${N}"
+echo -e "${D}Auto-refresh: bash ~/distributed_tpu_training/watch.sh${N}"

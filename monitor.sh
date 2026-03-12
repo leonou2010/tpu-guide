@@ -3,7 +3,7 @@
 # Design: all SSH + GCS queries run in parallel, static info prints immediately
 # Updated for centralized push coordinator (reads state.json + per-VM buckets)
 #
-# Usage: EXP=exp12c bash ~/tpu_guide/monitor.sh
+# Usage: EXP=exp12c bash ~/distributed_tpu_training/monitor.sh
 
 GCLOUD=~/google-cloud-sdk/bin/gcloud
 PROJECT=gcp-research-credits-489020
@@ -339,4 +339,4 @@ fi
 echo ""
 
 rm -rf "$tmpdir"
-echo -e "${D}Auto-refresh: EXP=$EXP bash ~/tpu_guide/watch.sh${N}"
+echo -e "${D}Auto-refresh: EXP=$EXP bash ~/distributed_tpu_training/watch.sh${N}"
