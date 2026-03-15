@@ -60,7 +60,7 @@ IDLE_SCALE_DOWN_S = 600  # 10 min of idle before scale-down (when no pending wor
 # Fleet definition: (name, zone, accel_type, bucket)
 # Edit this list to change the fleet composition.
 FLEET = [
-    # europe-west4-a — v6e-8, has internet, 8 VMs (64 chip quota)
+    # europe-west4-a — v6e-8, has internet, 7 VMs
     ('v6e-ew4a-1', 'europe-west4-a', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-europe-west4'),
     ('v6e-ew4a-2', 'europe-west4-a', 'v6e-8',
@@ -73,11 +73,9 @@ FLEET = [
      'gs://gcp-researchcredits-blocklab-europe-west4'),
     ('v6e-ew4a-6', 'europe-west4-a', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-europe-west4'),
-    ('v6e-ew4a-7', 'europe-west4-a', 'v6e-8',
-     'gs://gcp-researchcredits-blocklab-europe-west4'),
     ('v6e-ew4a-8', 'europe-west4-a', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-europe-west4'),
-    # us-east1-d — v6e-8, no internet, 8 VMs (64 chip quota)
+    # us-east1-d — v6e-8, no internet, 7 VMs
     ('v6e-ue1d-1', 'us-east1-d', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-us-east1'),
     ('v6e-ue1d-2', 'us-east1-d', 'v6e-8',
@@ -89,8 +87,6 @@ FLEET = [
     ('v6e-ue1d-5', 'us-east1-d', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-us-east1'),
     ('v6e-ue1d-6', 'us-east1-d', 'v6e-8',
-     'gs://gcp-researchcredits-blocklab-us-east1'),
-    ('v6e-ue1d-7', 'us-east1-d', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-us-east1'),
     ('v6e-ue1d-8', 'us-east1-d', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-us-east1'),
