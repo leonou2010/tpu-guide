@@ -609,10 +609,25 @@ def main():
             time.sleep(60)
             cycle += 1
 
-            # Periodic quota check + scale-down idle VMs under quota pressure
+            # Periodic quota check + health check count validation
             if cycle % 5 == 0:
                 ok, usage, limit = check_hc_quota()
-                print(f"[vm_manager] HEALTH_CHECKS: {usage}/{limit}", flush=True)
+                active_vms = len([s for s in slots if not s._shutdown])
+                expected_max = active_vms * 5  # ~5 health checks per VM empirically
+                print(f"[vm_manager] HEALTH_CHECKS: {usage}/{limit} (active_vms={active_vms} expected<={expected_max})", flush=True)
+                if usage > expected_max:
+                    print(f"[vm_manager] HC count {usage} > expected {expected_max} — running orphan cleanup", flush=True)
+                    live_ids = set()
+                    for s in slots:
+                        if not s._shutdown:
+                            # Extract numeric GCP VM ID from telemetry if available
+                            raw = gcs_read(f"{CONTROL_PLANE}/telemetry/{s.name}_boot.json")
+                            if raw:
+                                try:
+                                    live_ids.add(json.loads(raw).get('vm_id', ''))
+                                except Exception:
+                                    pass
+                    cleanup_orphan_health_checks(live_ids)
                 if not ok:
                     # Quota near limit — scale down VMs whose chips are all idle
                     pending, running, _, _ = get_queue_counts()
@@ -631,11 +646,6 @@ def main():
                                     slot.mark_shutdown()
                             else:
                                 slot._idle_since = None  # reset if chip becomes active
-
-            # Periodic HC cleanup
-            if cycle % hc_cleanup_interval == 0:
-                print(f"[vm_manager] Running orphan health check sweep...", flush=True)
-                cleanup_orphan_health_checks(set())
 
             # Check thread health
             dead = [t for t in threads if not t.is_alive()]

@@ -58,13 +58,18 @@ print(json.dumps(d))" | gsutil cp - "gs://gcp-researchcredits-blocklab-europe-we
 done
 ```
 
-### 5. Delete orphan health checks (GCS composite object metadata)
+### 5. Clear ALL health checks (reset quota to 0 before launch)
 ```bash
 ~/google-cloud-sdk/bin/gcloud compute health-checks list \
     --project=gcp-research-credits-489020 --format='value(name)' | \
   xargs -I{} ~/google-cloud-sdk/bin/gcloud compute health-checks delete {} \
     --project=gcp-research-credits-489020 --quiet 2>/dev/null
+# Confirm 0/75:
+~/google-cloud-sdk/bin/gcloud compute project-info describe \
+    --project=gcp-research-credits-489020 \
+    --format='table(quotas.metric,quotas.usage,quotas.limit)' | grep HEALTH
 ```
+# Safe to delete all — vm_manager recreates what it needs. Always do this before launch.
 
 ## Launch Commands
 
@@ -137,7 +142,19 @@ watch -n60 'echo "Validated: $(ls ~/sf_bema/results/exp13_rerun3/validated/ | wc
 
 ### 10. HEALTH_CHECKS quota exhaustion blocks ALL VM creation
 - **Quota**: 75/75 = blocks all types (v4, v5e, v6e)
-- **Fix**: Delete idle VMs before creating new ones (vm_manager now auto-scales down)
+- **Empirical rate**: ~5 health checks per VM. 16 v6e VMs = ~80 checks → exceeds 75 limit.
+- **Fix**: Just delete all health checks — safe to do at any time, vm_manager recreates what it needs:
+```bash
+~/google-cloud-sdk/bin/gcloud compute health-checks list \
+    --project=gcp-research-credits-489020 --format='value(name)' | \
+  xargs -I{} ~/google-cloud-sdk/bin/gcloud compute health-checks delete {} \
+    --project=gcp-research-credits-489020 --quiet 2>/dev/null
+# Verify clean:
+~/google-cloud-sdk/bin/gcloud compute project-info describe \
+    --project=gcp-research-credits-489020 \
+    --format='table(quotas.metric,quotas.usage,quotas.limit)' | grep HEALTH
+```
+- **When to run**: if vm_manager log shows "HEALTH_CHECKS near limit" or new VMs fail to create
 
 ## Setup Packages (local + GCS)
 | Arch | Local | GCS |
