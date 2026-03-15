@@ -179,6 +179,41 @@ v5e-uc1a-1..3  us-central1-a    v5e-8  (NO internet, QUOTA UNAVAILABLE — servi
 - v4 (us-central2-b): PENDING — zone down (GCP internal error since 01:00 UTC)
 - Raw: /tmp/unit_test_results/results.tsv | Report: /tmp/unit_test_results/stress_test_report.md
 
+## Design Principles (v3)
+
+### 1. GCS is the single source of truth for everything
+Before every launch, all artifacts must be on GCS — not assumed to be present on the VM:
+- **Setup packages** (`setup_<arch>.tar.gz`) — wheels, deploy scripts, code, data
+- **Model files** (`SmolLM2-135M/`) — downloaded by deploy script on VM creation
+- **Training data** (`data/smoltalk/`) — downloaded by deploy script, verified non-empty
+- **XLA cache** (`xla_cache_v6e/`) — seeded on deploy to avoid cold recompile (~15-45 min)
+- **Training code** (`sf_bema_exp13_rerun3.tar.gz`) — downloaded by deploy script
+
+If anything is missing from GCS, VMs silently fail or produce garbage. Upload everything before launch.
+
+### 2. Fleet is actively maintained, not fire-and-forget
+vm_manager continuously:
+- Creates VMs when slots are empty
+- Detects unhealthy babysitters and redeploys
+- Cleans orphan health checks when count mismatches active VMs
+- Scales down idle VMs when no pending work
+- Watchdog cron (every 5 min) restarts vm_manager if it crashes
+
+### 3. XLA compile is NOT a success indicator
+A VM that reaches `xla_compile` status is NOT runnable yet. XLA compile:
+- Takes 15-45 min on cold cache, 5 min with cache
+- Can hang indefinitely (XLA_STUCK_S=7200 timeout)
+- Does NOT mean the VM will produce valid results
+
+**The only indicator of a truly runnable VM is actual result logs** — JSONL loss output written to GCS. Until that appears, the VM is unproven.
+
+### 4. Monitor validates, not just counts
+monitor.py:
+- Downloads JSONL and verifies loss values are real numbers
+- Reclaims tasks whose heartbeats go stale (worker died mid-train)
+- Only increments validated/ count on confirmed good results
+- Stall detection tracks validated count (not completed count)
+
 ## Efficiency Lessons
 - v4 tasks failed repeatedly because data download used `|| true` — ALWAYS verify data after download
 - babysitter permanent-fail after 3 retries was too aggressive — TPU infra errors look like code errors
