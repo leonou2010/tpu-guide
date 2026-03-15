@@ -161,6 +161,9 @@ if [ ! -d "${_DATA_DIR}/train" ]; then
         gsutil -m cp "gs://gcp-researchcredits-blocklab-us-east1/data/smoltalk/data/val/"'*' "${_DATA_DIR}/val/" 2>/dev/null || true
     echo "Data: $(ls ${_DATA_DIR}/train/ 2>/dev/null | wc -l) train files, $(ls ${_DATA_DIR}/val/ 2>/dev/null | wc -l) val files"
 fi
+_train_count=$(ls ${_DATA_DIR}/train/ 2>/dev/null | wc -l)
+[ "$_train_count" -eq 0 ] && { echo "FATAL: training data empty after download"; report_phase "FAILED_NO_DATA"; exit 1; }
+echo "✓ Data verified: $_train_count train files"
 
 # Training script
 [ ! -f /tmp/train_v2_tpu.py ] && \
