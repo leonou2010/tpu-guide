@@ -94,31 +94,8 @@ FLEET = [
      'gs://gcp-researchcredits-blocklab-us-east1'),
     ('v6e-ue1d-8', 'us-east1-d', 'v6e-8',
      'gs://gcp-researchcredits-blocklab-us-east1'),
-    # us-central2-b — v4-8, no internet, 5 VMs
-    ('v4-uc2b-1', 'us-central2-b', 'v4-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    ('v4-uc2b-2', 'us-central2-b', 'v4-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    ('v4-uc2b-3', 'us-central2-b', 'v4-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    ('v4-uc2b-4', 'us-central2-b', 'v4-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    ('v4-uc2b-5', 'us-central2-b', 'v4-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    # europe-west4-b — v5e-8, no internet, 3 VMs
-    ('v5e-ew4b-1', 'europe-west4-b', 'v5litepod-8',
-     'gs://gcp-researchcredits-blocklab-europe-west4'),
-    ('v5e-ew4b-2', 'europe-west4-b', 'v5litepod-8',
-     'gs://gcp-researchcredits-blocklab-europe-west4'),
-    ('v5e-ew4b-3', 'europe-west4-b', 'v5litepod-8',
-     'gs://gcp-researchcredits-blocklab-europe-west4'),
-    # us-central1-a — v5e-8, no internet, 3 VMs
-    ('v5e-uc1a-1', 'us-central1-a', 'v5litepod-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    ('v5e-uc1a-2', 'us-central1-a', 'v5litepod-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
-    ('v5e-uc1a-3', 'us-central1-a', 'v5litepod-8',
-     'gs://gcp-researchcredits-blocklab-1-us-central2'),
+    # us-central2-b — DISABLED: zone down (GCP internal error since 2026-03-15)
+    # v5e — DISABLED: serving quota limit 4 (needs GCP support ticket)
 ]
 
 
