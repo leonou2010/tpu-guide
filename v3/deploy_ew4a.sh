@@ -186,6 +186,7 @@ fi
 # ── Launch babysitter ─────────────────────────────────────────────────────────
 report_phase "LAUNCHING_BABYSITTER"
 EXP=${EXP:-exp13_rerun4}
+exec 9>&-  # release deploy lock before launching babysitter
 nohup $_PY -u ~/pull_code/babysitter.py \
     --tpu-name "$TPU_NAME" \
     --zone "$ZONE" \
