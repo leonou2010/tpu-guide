@@ -19,7 +19,7 @@ import time
 # Add distributed_tpu_training to path for coordinator helpers
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gcs import gcs_write, gcs_list, gcs_delete_prefix, CONTROL_PLANE
+from gcs import gcs_write, gcs_list, gcs_delete, gcs_delete_prefix, CONTROL_PLANE
 
 
 def load_exp_config():
@@ -112,6 +112,23 @@ def main():
 
     # Clear if requested
     if args.clear and not args.dry_run:
+        drain_flag = f"{CONTROL_PLANE}/DRAIN"
+        print("Setting DRAIN flag — babysitters will stop claiming new tasks...")
+        gcs_write(drain_flag, '{"reason":"populate --clear","ts":' + str(int(time.time())) + '}')
+
+        # Wait for running/ to empty (babysitters finish current tasks, don't claim new ones)
+        drain_timeout = 300  # 5 min max wait
+        drain_start = time.time()
+        while time.time() - drain_start < drain_timeout:
+            running = gcs_list(f"{CONTROL_PLANE}/running")
+            if not running:
+                print("running/ is empty — safe to clear")
+                break
+            print(f"  Waiting for {len(running)} running tasks to finish... ({int(time.time()-drain_start)}s)")
+            time.sleep(15)
+        else:
+            print(f"WARNING: Drain timeout after {drain_timeout}s — {len(running)} tasks still running. Clearing anyway.")
+
         print("Clearing pending/running/failed...")
         gcs_delete_prefix(f"{CONTROL_PLANE}/pending")
         gcs_delete_prefix(f"{CONTROL_PLANE}/running")
@@ -145,6 +162,11 @@ def main():
             populated += 1
             if populated % 10 == 0:
                 print(f"  Uploaded {populated} tasks...", flush=True)
+
+    # Remove DRAIN flag so babysitters can resume claiming
+    if args.clear and not args.dry_run:
+        gcs_delete(drain_flag)
+        print("DRAIN flag removed — babysitters can claim new tasks")
 
     print(f"\nDone: populated={populated}, skipped={skipped} (completed/validated)")
     if not args.dry_run:

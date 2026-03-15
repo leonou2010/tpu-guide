@@ -3,16 +3,16 @@
 # Also: deletes PREEMPTED VMs, deploys babysitter to READY VMs without one
 # Usage: nohup bash ~/distributed_tpu_training/pull/vm_requester.sh >> /tmp/vm_requester.log 2>&1 &
 
-# Single-instance guard — PID file + kill -0 (no fd inheritance by children)
+# Single-instance guard (lock first, then pidfile; avoids stale pidfile races)
 mkdir -p "$HOME/.locks"
-_VM_PID_FILE="$HOME/.locks/vm_requester.pid"
-if [ -f "$_VM_PID_FILE" ]; then
-  _OLD_PID=$(cat "$_VM_PID_FILE" 2>/dev/null)
-  if [ -n "$_OLD_PID" ] && kill -0 "$_OLD_PID" 2>/dev/null; then
-    echo "vm_requester already running (PID $_OLD_PID) — exiting"
-    exit 0
-  fi
+_VM_LOCK_FILE="$HOME/.locks/vm_requester.lock"
+exec 9>"$_VM_LOCK_FILE"
+if ! flock -n 9; then
+  echo "vm_requester already running (lock busy: $_VM_LOCK_FILE) — exiting"
+  exit 0
 fi
+
+_VM_PID_FILE="$HOME/.locks/vm_requester.pid"
 echo $$ > "$_VM_PID_FILE"
 trap 'rm -f "$_VM_PID_FILE"' EXIT
 
@@ -160,6 +160,36 @@ MAX_DEPLOY_ATTEMPTS=3
 DEPLOY_ATTEMPT_DIR=/tmp/vm_deploy_attempts
 mkdir -p "$DEPLOY_ATTEMPT_DIR"
 
+# Per-zone internal-error counter — GCP "internal error" on create means no capacity.
+# After MAX_INTERNAL_ERRORS consecutive failures, skip zone for INTERNAL_ERROR_BACKOFF_CYCLES cycles.
+MAX_INTERNAL_ERRORS=3
+INTERNAL_ERROR_BACKOFF_CYCLES=5
+INTERNAL_ERROR_DIR=/tmp/vm_internal_error
+mkdir -p "$INTERNAL_ERROR_DIR"
+
+get_internal_errors() { local z=$1; local f="${INTERNAL_ERROR_DIR}/${z//\//_}"; [ -f "$f" ] && cat "$f" || echo "0 0"; }
+set_internal_errors() { local z=$1 count=$2 since=$3; echo "$count $since" > "${INTERNAL_ERROR_DIR}/${z//\//_}"; }
+clear_internal_errors() { local z=$1; rm -f "${INTERNAL_ERROR_DIR}/${z//\//_}"; }
+
+zone_internal_error_blocked() {
+  local z=$1; local now cycle
+  now=$(date +%s); cycle=$(( now / INTERVAL ))
+  read -r count since <<< "$(get_internal_errors "$z")"
+  [ "${count:-0}" -lt "$MAX_INTERNAL_ERRORS" ] && return 1  # not blocked
+  local cycles_elapsed=$(( cycle - ${since:-0} ))
+  [ "$cycles_elapsed" -lt "$INTERNAL_ERROR_BACKOFF_CYCLES" ] && return 0  # blocked
+  clear_internal_errors "$z"; return 1  # backoff expired
+}
+
+record_internal_error() {
+  local z=$1; local cycle
+  cycle=$(( $(date +%s) / INTERVAL ))
+  read -r count _since <<< "$(get_internal_errors "$z")"
+  count=$(( ${count:-0} + 1 ))
+  set_internal_errors "$z" "$count" "$cycle"
+  echo "$count"
+}
+
 get_deploy_attempts() {
   local name=$1
   local f="${DEPLOY_ATTEMPT_DIR}/${name}"
@@ -224,8 +254,13 @@ get_vm_hostname() {
 cache_vm_hostname() {
   local name=$1 zone=$2
   local hn
-  hn=$($GCLOUD alpha compute tpus tpu-vm ssh "$name" --zone="$zone" --project=$PROJECT \
-    --tunnel-through-iap --command="hostname -s" 2>/dev/null | tr -d '[:space:]' || true)
+  if command -v timeout >/dev/null 2>&1; then
+    hn=$(timeout 60s $GCLOUD alpha compute tpus tpu-vm ssh "$name" --zone="$zone" --project=$PROJECT \
+      --tunnel-through-iap --command="hostname -s" 2>/dev/null | tr -d '[:space:]' || true)
+  else
+    hn=$($GCLOUD alpha compute tpus tpu-vm ssh "$name" --zone="$zone" --project=$PROJECT \
+      --tunnel-through-iap --command="hostname -s" 2>/dev/null | tr -d '[:space:]' || true)
+  fi
   [ -n "$hn" ] && echo "$hn" > "${HOSTNAME_CACHE_DIR}/${name}"
   echo "$hn"
 }
@@ -247,12 +282,13 @@ vm_heartbeat_age() {
       local ts
       ts=$(gsutil cat "$hb_path" 2>/dev/null | \
         python3 -c "import sys,json; print(int(json.load(sys.stdin).get('timestamp',0)))" 2>/dev/null || echo 0)
-      if [ "${ts:-0}" -gt 0 ]; then
-        local age=$(( now - ts ))
-        [ "$age" -lt "$best_age" ] && best_age=$age
-      fi
-    done <<< "$hb_paths"
-  }
+	      if [ "${ts:-0}" -gt 0 ]; then
+	        local age=$(( now - ts ))
+	        [ "$age" -lt 0 ] && age=0  # guard against clock skew
+	        [ "$age" -lt "$best_age" ] && best_age=$age
+	      fi
+	    done <<< "$hb_paths"
+	  }
 
   # Fast path: friendly name
   _scan_hb_pattern "$name"
@@ -267,18 +303,258 @@ vm_heartbeat_age() {
   echo $best_age
 }
 
+# Check the STATUS field from the freshest chip heartbeat for a VM.
+# Returns: training|xla_compile|idle|uploading|unknown
+vm_heartbeat_status() {
+  local name=$1
+  local best_status="unknown" best_age=9999
+  local now
+  now=$(date +%s)
+
+  _scan_status_pattern() {
+    local pattern=$1
+    local hb_paths
+    hb_paths=$(gsutil ls "${CTRL}/heartbeats/${pattern}_chip*.json" 2>/dev/null || true)
+    [ -z "$hb_paths" ] && return
+    while IFS= read -r hb_path; do
+      [ -z "$hb_path" ] && continue
+      local hb_json
+      hb_json=$(gsutil cat "$hb_path" 2>/dev/null || true)
+      [ -z "$hb_json" ] && continue
+      local ts status
+      ts=$(echo "$hb_json" | python3 -c "import sys,json; print(int(json.load(sys.stdin).get('timestamp',0)))" 2>/dev/null || echo 0)
+      status=$(echo "$hb_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo unknown)
+	      if [ "${ts:-0}" -gt 0 ]; then
+	        local age=$(( now - ts ))
+	        [ "$age" -lt 0 ] && age=0  # guard against clock skew
+	        if [ "$age" -lt "$best_age" ]; then
+	          best_age=$age
+	          best_status=$status
+	        fi
+	      fi
+    done <<< "$hb_paths"
+  }
+
+  _scan_status_pattern "$name"
+  if [ "$best_status" = "unknown" ]; then
+    local hn
+    hn=$(get_vm_hostname "$name")
+    [ -n "$hn" ] && _scan_status_pattern "$hn"
+  fi
+
+  echo "$best_status"
+}
+
+# Fetch best heartbeat info for a VM (from the freshest chip heartbeat).
+# Prints: "<age_s> <status> <step>"
+vm_heartbeat_best() {
+  local name=$1
+  local now best_age=9999 best_status="unknown" best_step=0
+  now=$(date +%s)
+
+  _scan_best_pattern() {
+    local pattern=$1
+    local hb_paths
+    hb_paths=$(gsutil ls "${CTRL}/heartbeats/${pattern}_chip*.json" 2>/dev/null || true)
+    [ -z "$hb_paths" ] && return
+    while IFS= read -r hb_path; do
+      [ -z "$hb_path" ] && continue
+      local hb_json
+      hb_json=$(gsutil cat "$hb_path" 2>/dev/null || true)
+      [ -z "$hb_json" ] && continue
+      local ts status step
+      read -r ts status step <<<"$(echo "$hb_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d.get('timestamp',0)), d.get('status','unknown'), int(d.get('step',0)))" 2>/dev/null || echo "0 unknown 0")"
+      [ "${ts:-0}" -le 0 ] && continue
+      local age=$(( now - ts ))
+      [ "$age" -lt 0 ] && age=0
+      if [ "$age" -lt "$best_age" ]; then
+        best_age=$age
+        best_status=$status
+        best_step=$step
+      fi
+    done <<< "$hb_paths"
+  }
+
+  _scan_best_pattern "$name"
+  if [ "$best_status" = "unknown" ]; then
+    local hn
+    hn=$(get_vm_hostname "$name")
+    [ -n "$hn" ] && _scan_best_pattern "$hn"
+  fi
+
+  echo "$best_age $best_status $best_step"
+}
+
+# Status/step tracking for "stuck-but-heartbeating" detection (no VM changes required).
+STATUS_TRACK_DIR=/tmp/vm_status_track
+STEP_TRACK_DIR=/tmp/vm_step_track
+mkdir -p "$STATUS_TRACK_DIR" "$STEP_TRACK_DIR"
+
+status_duration_s() {
+  local name=$1 status=$2 now=$3
+  local f="${STATUS_TRACK_DIR}/${name}"
+  local last_status="" seen_at=0
+  if [ -f "$f" ]; then
+    read -r last_status seen_at < "$f" 2>/dev/null || true
+  fi
+  if [ "$status" != "$last_status" ] || [ "${seen_at:-0}" -le 0 ]; then
+    echo "$status $now" > "$f"
+    echo 0
+    return
+  fi
+  echo $(( now - seen_at ))
+}
+
+step_stale_s() {
+  local name=$1 step=$2 now=$3
+  local f="${STEP_TRACK_DIR}/${name}"
+  local last_step=-1 changed_at=0
+  if [ -f "$f" ]; then
+    read -r last_step changed_at < "$f" 2>/dev/null || true
+  fi
+  if [ "$step" -ne "${last_step:--1}" ] || [ "${changed_at:-0}" -le 0 ]; then
+    echo "$step $now" > "$f"
+    echo 0
+    return
+  fi
+  echo $(( now - changed_at ))
+}
+
 deploy_babysitter() {
-  local name=$1 zone=$2 bucket=$3 wandb_mode=${4:-disabled}
+  local name=$1 zone=$2 bucket=$3 wandb_mode=${4:-disabled} force_redeploy=${5:-0}
   echo "  Deploying babysitter to $name..."
-  $GCLOUD alpha compute tpus tpu-vm ssh $name --zone=$zone --project=$PROJECT \
+  local env_prefix=""
+  if [ "$force_redeploy" = "1" ]; then
+    env_prefix="FORCE_REDEPLOY=1 "
+    echo "  $name: FORCE_REDEPLOY=1 (override deploy guard)"
+  fi
+  # timeout 120s: prevents a stuck SSH from blocking the calling process indefinitely.
+  # The deploy runs in background (&) so this timeout only kills the one stuck SSH,
+  # not the rest of the cycle. The global `wait` after the deploy loop is bounded by
+  # the worst-case SSH timeout (120s × concurrent deploys) rather than being unbounded.
+  timeout 120s $GCLOUD alpha compute tpus tpu-vm ssh $name --zone=$zone --project=$PROJECT \
     --tunnel-through-iap --command="
       mkdir -p ~/pull_code
       gcloud storage cp '${bucket}/pull_code/*' ~/pull_code/ 2>/dev/null || \
       gsutil -m cp '${bucket}/pull_code/*' ~/pull_code/ 2>/dev/null
       chmod +x ~/pull_code/deploy_babysitter.sh
       # deploy_babysitter.sh handles its own health check and kill logic
-      TPU_NAME=${name} ZONE=${zone} WANDB_MODE=${wandb_mode} bash ~/pull_code/deploy_babysitter.sh
+      ${env_prefix}TPU_NAME=${name} ZONE=${zone} WANDB_MODE=${wandb_mode} bash ~/pull_code/deploy_babysitter.sh
     " 2>&1 | tail -5
+  local rc=${PIPESTATUS[0]}
+  if [ $rc -eq 124 ]; then
+    echo "  $name: deploy SSH timed out after 120s — will retry next cycle"
+  fi
+}
+
+# ── Orphan health check sweep ────────────────────────────────────────────────
+# GCP auto-creates 5 health checks + 5 health-check services per TPU VM.
+# They are NOT auto-deleted on VM deletion — they accumulate against quota (default 75).
+# delete_vm() handles cleanup for VMs we explicitly delete; this sweep handles
+# VMs deleted outside vm_requester (direct GCP preemption, manual gcloud delete).
+#
+# Run every HC_CLEANUP_INTERVAL cycles (~20 min). Safe: only deletes health checks
+# whose VM ID does not appear in any live TPU VM across all watched zones.
+HC_CLEANUP_INTERVAL=10
+_hc_cleanup_counter=0
+
+cleanup_orphan_health_checks() {
+  echo "  [HC cleanup] Scanning for orphaned health checks..."
+  local token
+  token=$($GCLOUD auth print-access-token 2>/dev/null || true)
+  [ -z "$token" ] && echo "  [HC cleanup] No auth token — skipping" && return
+
+  # Collect all live VM IDs across all zones
+  local live_ids=""
+  for zoneconf in "${ZONES[@]}"; do
+    read -r zone _rest <<< "$zoneconf"
+    local ids
+    ids=$($GCLOUD alpha compute tpus tpu-vm list --zone="$zone" --project=$PROJECT \
+      --format="value(id)" 2>/dev/null || true)
+    live_ids="$live_ids $ids"
+  done
+
+  local total_deleted=0
+  for region in europe-west4 us-east1 us-central2; do
+    local base="https://compute.googleapis.com/compute/v1/projects/${PROJECT}/regions/${region}"
+
+    # List all health check names in this region
+    local hc_names
+    hc_names=$($GCLOUD compute health-checks list --project=$PROJECT \
+      --filter="region:$region" --format="value(name)" 2>/dev/null || true)
+    [ -z "$hc_names" ] && continue
+
+    # Extract unique VM IDs that have no live VM
+    local orphan_ids
+    orphan_ids=$(echo "$hc_names" | \
+      python3 -c "
+import sys, re
+live = set('${live_ids}'.split())
+seen = set()
+for name in sys.stdin.read().splitlines():
+    m = re.search(r'tpu-\d+-(\d+)-', name)
+    if m:
+        vid = m.group(1)
+        if vid not in live and vid not in seen:
+            seen.add(vid)
+            print(vid)
+" 2>/dev/null || true)
+
+    [ -z "$orphan_ids" ] && echo "  [HC cleanup] $region: no orphans" && continue
+
+    local orphan_count; orphan_count=$(echo "$orphan_ids" | grep -c .)
+    echo "  [HC cleanup] $region: found $orphan_count orphan VM IDs — cleaning up..."
+
+    # Refresh token per region (long sweep can exceed 1h token lifetime)
+    token=$($GCLOUD auth print-access-token 2>/dev/null || true)
+
+    while IFS= read -r vm_id; do
+      [ -z "$vm_id" ] && continue
+
+      # Step 1: delete health-check services referencing this VM
+      local svc_names
+      svc_names=$(curl -s -H "Authorization: Bearer $token" \
+        "${base}/healthCheckServices" 2>/dev/null | \
+        python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+vid='${vm_id}'
+for item in d.get('items',[]):
+    if any(vid in hc for hc in item.get('healthChecks',[])):
+        print(item['name'])
+" 2>/dev/null || true)
+      if [ -n "$svc_names" ]; then
+        local svc_count; svc_count=$(echo "$svc_names" | grep -c .)
+        echo "$svc_names" | while IFS= read -r svc; do
+          curl -s -X DELETE -H "Authorization: Bearer $token" \
+            "${base}/healthCheckServices/${svc}" >/dev/null 2>&1 || true
+        done
+        echo "  [HC cleanup] $region: deleted $svc_count services for vm=$vm_id"
+        sleep 2  # let services clear before deleting checks
+      fi
+
+      # Step 2: delete the health checks themselves
+      local hcs
+      hcs=$($GCLOUD compute health-checks list \
+        --project=$PROJECT --filter="name~${vm_id} AND region:${region}" \
+        --format="value(name)" 2>/dev/null || true)
+      if [ -n "$hcs" ]; then
+        local hc_count; hc_count=$(echo "$hcs" | grep -c .)
+        echo "$hcs" | while IFS= read -r hc; do
+          $GCLOUD compute health-checks delete "$hc" \
+            --region="$region" --project=$PROJECT --quiet 2>/dev/null || true
+        done
+        echo "  [HC cleanup] $region: deleted $hc_count health checks for vm=$vm_id"
+        total_deleted=$((total_deleted + hc_count))
+      fi
+    done <<< "$orphan_ids"
+  done
+
+  if [ "$total_deleted" -gt 0 ]; then
+    echo "  [HC cleanup] Done — deleted $total_deleted orphan health checks"
+  else
+    echo "  [HC cleanup] Done — no orphans found"
+  fi
 }
 
 # ── CREATING grace tracking ───────────────────────────────────────────────────
@@ -310,6 +586,39 @@ clear_creating() {
 
 while true; do
   echo "[$(date -u '+%H:%M:%S')] === VM Request Cycle ==="
+
+  # Periodic orphan health check sweep (every HC_CLEANUP_INTERVAL cycles)
+  _hc_cleanup_counter=$(( _hc_cleanup_counter + 1 ))
+  if [ "$(( _hc_cleanup_counter % HC_CLEANUP_INTERVAL ))" -eq 0 ]; then
+    cleanup_orphan_health_checks
+  fi
+
+  # ETA estimate from queue state
+  _pending=$(gsutil ls "${CTRL}/pending/" 2>/dev/null | wc -l)
+  _running=$(gsutil ls "${CTRL}/running/" 2>/dev/null | wc -l)
+  _completed=$(gsutil ls "${CTRL}/completed/" 2>/dev/null | wc -l)
+  _total=$(( _pending + _running + _completed ))
+  _remaining=$(( _pending + _running ))
+  if [ "$_completed" -gt 0 ] && [ "$_remaining" -gt 0 ]; then
+    # Rate from ETA state file
+    _eta_file="/tmp/vm_requester_eta.json"
+    _now_ts=$(date +%s)
+    _prev_completed=0; _prev_ts=$_now_ts
+    [ -f "$_eta_file" ] && read -r _prev_completed _prev_ts < "$_eta_file"
+    _delta_tasks=$(( _completed - _prev_completed ))
+    _delta_secs=$(( _now_ts - _prev_ts ))
+    if [ "$_delta_secs" -gt 60 ] && [ "$_delta_tasks" -gt 0 ]; then
+      _rate_per_hr=$(echo "scale=1; $_delta_tasks * 3600 / $_delta_secs" | bc 2>/dev/null || echo "?")
+      _eta_mins=$(echo "scale=0; $_remaining * $_delta_secs / $_delta_tasks / 60" | bc 2>/dev/null || echo "?")
+      echo "  ETA: ~${_eta_mins}min | rate: ${_rate_per_hr} tasks/hr | ${_completed}/${_total} done, ${_remaining} remaining"
+      echo "$_completed $_now_ts" > "$_eta_file"
+    else
+      echo "  Progress: ${_completed}/${_total} done, ${_remaining} remaining (ETA available after first completions)"
+      [ ! -f "$_eta_file" ] && echo "$_completed $_now_ts" > "$_eta_file"
+    fi
+  else
+    echo "  Progress: ${_completed}/${_total:-?} done, ${_remaining} remaining"
+  fi
 
   # Check HEALTH_CHECKS quota once per cycle — skip all creates if near limit
   HC_STATUS=$(check_health_checks_quota)
@@ -370,14 +679,33 @@ while true; do
     # Phase 2: Deploy babysitter to READY VMs with stale/missing heartbeats.
     # Dead VM detection: if no heartbeat after MAX_DEPLOY_ATTEMPTS, delete the VM.
     # Use GCS heartbeat as truth source (survives local /tmp resets).
-    while IFS=',' read -r name state; do
-      [ -z "$name" ] && continue
-      [ "$state" != "READY" ] && continue
-      hb_age=$(vm_heartbeat_age "$name")
-      if [ "$hb_age" -gt 2700 ]; then
-        attempts=$(get_deploy_attempts "$name")
-        # Check boot telemetry for FAILED_ENV — log clearly so it's obvious in output
-        _boot_phase=$(gsutil cat "${CTRL}/telemetry/${name}_boot.json" 2>/dev/null | \
+	    while IFS=',' read -r name state; do
+	      [ -z "$name" ] && continue
+	      [ "$state" != "READY" ] && continue
+	      _now=$(date +%s)
+	      read -r hb_age hb_status hb_step <<<"$(vm_heartbeat_best "$name")"
+	      force_deploy=0
+
+	      # Stuck-but-heartbeating detection:
+	      # The old check used hb_age, but heartbeats refresh frequently so hb_age stays small.
+	      # Track status duration and step progress locally across cycles instead.
+	      XLA_STUCK_THRESHOLD=1200      # 20 min (compile/cache warm can be slow)
+	      NO_PROGRESS_THRESHOLD=1800    # 30 min (avoid false positives if logs are sparse)
+	      status_dur=$(status_duration_s "$name" "$hb_status" "$_now")
+	      step_stale=$(step_stale_s "$name" "${hb_step:-0}" "$_now")
+	      if [ "$hb_status" = "xla_compile" ] && [ "$hb_age" -lt 2700 ] && [ "$status_dur" -gt "$XLA_STUCK_THRESHOLD" ]; then
+	        echo "  $name: status=xla_compile for ${status_dur}s (> ${XLA_STUCK_THRESHOLD}s) — treating as stale (force redeploy)"
+	        hb_age=9999  # Force redeploy path
+	        force_deploy=1
+	      elif [ "$hb_status" = "training" ] && [ "$hb_age" -lt 2700 ] && [ "$step_stale" -gt "$NO_PROGRESS_THRESHOLD" ]; then
+	        echo "  $name: status=training but step=${hb_step} unchanged for ${step_stale}s (> ${NO_PROGRESS_THRESHOLD}s) — treating as stale (force redeploy)"
+	        hb_age=9999  # Force redeploy path
+	        force_deploy=1
+	      fi
+	      if [ "$hb_age" -gt 2700 ]; then
+	        attempts=$(get_deploy_attempts "$name")
+	        # Check boot telemetry for FAILED_ENV — log clearly so it's obvious in output
+	        _boot_phase=$(gsutil cat "${CTRL}/telemetry/${name}_boot.json" 2>/dev/null | \
           python3 -c "import sys,json; print(json.load(sys.stdin).get('phase',''))" 2>/dev/null || true)
         if [[ "$_boot_phase" == FAILED_ENV* ]]; then
           echo "  $name: FAILED_ENV in boot telemetry — env broken, MAX_DEPLOY_ATTEMPTS=$MAX_DEPLOY_ATTEMPTS applies"
@@ -397,14 +725,14 @@ while true; do
           incr_deploy_attempts "$name"
           # Cache hostname before deploy so next cycle can check hostname-based heartbeats
           [ -z "$(get_vm_hostname "$name")" ] && cache_vm_hostname "$name" "$zone" &
-          deploy_babysitter "$name" "$zone" "$BUCKET" "$WANDB" &
-        else
-          echo "  $name: heartbeat age=${hb_age}s but deploy cooldown active — skipping (attempt ${attempts}/$MAX_DEPLOY_ATTEMPTS)"
-        fi
+	          deploy_babysitter "$name" "$zone" "$BUCKET" "$WANDB" "$force_deploy" &
+	        else
+	          echo "  $name: heartbeat age=${hb_age}s but deploy cooldown active — skipping (attempt ${attempts}/$MAX_DEPLOY_ATTEMPTS)"
+	        fi
       else
-        # VM is healthy — reset deploy attempt counter
+        # VM is healthy and training — reset deploy attempt counter
         clear_deploy_attempts "$name"
-        echo "  $name: heartbeat age=${hb_age}s — healthy, skipping deploy"
+        echo "  $name: heartbeat age=${hb_age}s status=$hb_status — healthy, skipping deploy"
       fi
     done <<< "$vm_list"
     # DON'T wait here — let deploys run concurrently while we create VMs
@@ -414,6 +742,8 @@ while true; do
     # Skip if HEALTH_CHECKS quota is near limit
     if [ "$vm_type" = "fallback" ] && $v6e_has_capacity; then
       echo "  $zone: SKIPPING creation — v6e has capacity (prioritising v6e)"
+    elif zone_internal_error_blocked "$zone"; then
+      echo "  $zone: SKIPPING creation — repeated internal errors (backoff active)"
     elif [ "$total" -lt "$max_vms" ] && ! $HC_BLOCKED; then
       # Track v6e capacity for this cycle
       [ "$vm_type" = "primary" ] && v6e_has_capacity=true
@@ -451,12 +781,21 @@ TPU_NAME=${name} ZONE=${zone} WANDB_MODE=${WANDB} FORCE_REDEPLOY=1 bash /tmp/dep
 
           if echo "$create_out" | grep -qi 'ALREADY_EXISTS'; then
             echo "  $name: ALREADY_EXISTS — skipping increment"
-            # VM exists but wasn't listed (eventual consistency) — don't create
+            mark_creating "$name"
+            clear_internal_errors "$zone"
           elif echo "$create_out" | grep -qi 'RESOURCE_EXHAUSTED\|quota\|insufficient'; then
             echo "  $zone: RESOURCE_EXHAUSTED — backing off zone for this cycle"
             zone_exhausted=true
+          elif echo "$create_out" | grep -qi 'internal error\|code.*13'; then
+            _err_count=$(record_internal_error "$zone")
+            echo "  $zone: internal error on $name (${_err_count}/${MAX_INTERNAL_ERRORS}) — GCP capacity issue"
+            if [ "$_err_count" -ge "$MAX_INTERNAL_ERRORS" ]; then
+              echo "  $zone: ${MAX_INTERNAL_ERRORS}+ internal errors — backing off for ${INTERNAL_ERROR_BACKOFF_CYCLES} cycles"
+              zone_exhausted=true
+            fi
           elif [ $create_rc -eq 0 ]; then
             echo "  CREATED $name!"
+            clear_internal_errors "$zone"
             mark_creating "$name"
             created=$((created + 1))
             sleep 15  # brief pause before next creation

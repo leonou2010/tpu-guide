@@ -30,7 +30,7 @@ import time
 # Add pull/ to path for gcs module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gcs import (claim_task, complete_task, fail_task, write_heartbeat,
-                 gcs_write, gcs_copy, gcs_delete_prefix, CONTROL_PLANE)
+                 gcs_write, gcs_copy, gcs_delete_prefix, gcs_exists, CONTROL_PLANE)
 
 # ── Config ───────────────────────────────────────────────────────────────
 
@@ -218,13 +218,17 @@ def run_training(task, chip_idx, worker_id):
     task_gcs_ckpt_dir = f'{gcs_base}/{exp}' if gcs_base else ''
 
     cmd = [sys.executable, '-u', train_script] + overrides
+    launch_mode = os.environ.get('LAUNCH_MODE', 'single')
     env = {
         **os.environ,
         'TPU_VISIBLE_CHIPS': str(chip_idx),
         'TPU_PROCESS_BOUNDS': '1,1,1',
         'TPU_NUM_WORKERS': '1',
         'CHIPS_PER_HOST': '1',
-        'LAUNCH_MODE': 'pjrt',   # was 'single' (debug path) — pjrt is production path
+        # NOTE: This babysitter runs 1 chip per training process. Using LAUNCH_MODE='pjrt'
+        # can spawn child processes and has repeatedly caused libtpu load failures in practice.
+        # Default to 'single' unless explicitly overridden.
+        'LAUNCH_MODE': launch_mode,
         'PJRT_DEVICE': 'TPU',
         'PYTHONUNBUFFERED': '1',
         'CHECKPOINT_DIR': task_ckpt_dir,
@@ -366,6 +370,16 @@ def chip_worker(chip_idx, num_chips):
             print(f"[chip{chip_idx}] Preemption detected — stopping task claiming", flush=True)
             break
 
+        # Check for DRAIN flag — set by populate --clear to prevent retry-burning during requeue
+        _drain_flag = f"{CONTROL_PLANE}/DRAIN"
+        if gcs_exists(_drain_flag):
+            write_heartbeat(worker_id, None, 0, "idle", status="drain")
+            if idle_count % 5 == 0:
+                print(f"[chip{chip_idx}] DRAIN mode active — not claiming tasks (populate --clear in progress)", flush=True)
+            idle_count += 1
+            time.sleep(IDLE_POLL_INTERVAL)
+            continue
+
         # Claim a task
         task = claim_task(worker_id)
 
@@ -424,9 +438,28 @@ def chip_worker(chip_idx, num_chips):
                 pass
 
             # Retry classification: infra crash vs code error
+            # RULE: infra errors (missing libs, file permissions, TPU init, OOM) always retry.
+            # Only classify as permanent code error if it's clearly a logic bug (not env/infra).
             current_retries = task.get('retries', 0)
-            infra_fail = (rc == -9) or any(s in last_lines for s in ['Killed', 'preempted', 'SIGKILL', 'preemption'])
-            code_fail = (rc == 1) and any(s in last_lines for s in ['Traceback', 'Error:', 'RuntimeError'])
+            _INFRA_PATTERNS = [
+                # Signals / kernel kills
+                'Killed', 'preempted', 'SIGKILL', 'preemption',
+                # libtpu / torch_xla environment failures
+                'libtpu not found', 'libtpu.so', 'No module named',
+                'cannot open shared object file',
+                # TPU init / barrier / session errors (all transient device errors)
+                'TPU initialization failed', 'Timeout while waiting for barrier',
+                'PRE_START_SESSION_BARRIER', 'Cancelling all calls',
+                'Internal: Failed to connect', 'grpc error',
+                # File system / permission errors
+                'PermissionError: Permission denied', 'OSError: [Errno',
+                'cannot be opened',  # checkpoint write failure (root-owned dir)
+                # Device contention
+                'Device or resource busy',
+            ]
+            infra_fail = (rc == -9) or any(s in last_lines for s in _INFRA_PATTERNS)
+            code_fail = (rc == 1) and not infra_fail and any(
+                s in last_lines for s in ['Traceback', 'Error:'])
             if infra_fail:
                 should_retry = True
                 error_label = f"infra_crash rc={rc}"
@@ -446,9 +479,16 @@ def chip_worker(chip_idx, num_chips):
                 pass
 
             # Adjust cooldown based on error type
+            # TPU init failures need longer recovery time — device takes 30-60s to reset
+            _TPU_INIT_PATTERNS = ['TPU initialization failed', 'Cancelling all calls',
+                                  'Timeout while waiting for barrier', 'PRE_START_SESSION_BARRIER',
+                                  'Internal: Failed to connect']
             if 'Device or resource busy' in last_lines or 'vfio' in last_lines.lower():
                 print(f"[chip{chip_idx}] Device lock detected. Waiting 90s.", flush=True)
                 wait_s = 90
+            elif any(p in last_lines for p in _TPU_INIT_PATTERNS):
+                print(f"[chip{chip_idx}] TPU init/session error. Waiting 60s for device recovery.", flush=True)
+                wait_s = 60 + random.randint(0, 30)
             elif rc == -9:
                 print(f"[chip{chip_idx}] SIGKILL detected (OOM?). Waiting 30s.", flush=True)
                 wait_s = 30 + random.randint(0, 30)

@@ -12,6 +12,8 @@
 set -uo pipefail
 
 # ── Redirect own output to deploy log ────────────────────────────────────────
+# Must remove stale/root-owned log BEFORE exec redirect (exec fails if file not writable)
+sudo rm -f /tmp/deploy_babysitter.log 2>/dev/null || rm -f /tmp/deploy_babysitter.log 2>/dev/null || true
 exec >> /tmp/deploy_babysitter.log 2>&1
 echo "=== deploy_babysitter.sh started at $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
 
@@ -49,6 +51,8 @@ report_phase() {
     local phase=$1
     local ts
     ts=$(date +%s)
+    # Remove stale root-owned file before writing (permission denied otherwise)
+    sudo rm -f /tmp/boot_state.json 2>/dev/null || rm -f /tmp/boot_state.json 2>/dev/null || true
     printf '{"tpu_name":"%s","zone":"%s","phase":"%s","timestamp":%s}\n' \
         "$TPU_NAME" "${ZONE:-}" "$phase" "$ts" > /tmp/boot_state.json
     # Best-effort upload — don't fail if GCS unreachable
@@ -101,18 +105,24 @@ if [ -z "${FORCE_REDEPLOY:-}" ]; then
 fi
 
 # ── Kill existing processes ───────────────────────────────────────────────────
-echo "Killing existing processes..."
+# Use sudo to kill root-owned processes (root babysitters launched by earlier sessions).
+# If sudo is unavailable, fall through to user-level kill (handles non-root babysitters).
+echo "Killing existing processes (sudo+user)..."
 tmux kill-server 2>/dev/null || true
-pkill -9 -f babysitter.py 2>/dev/null || true
-pkill -9 -f train_tpu.py 2>/dev/null || true
+sudo pkill -9 -f babysitter.py 2>/dev/null || pkill -9 -f babysitter.py 2>/dev/null || true
+sudo pkill -9 -f train_tpu.py 2>/dev/null || pkill -9 -f train_tpu.py 2>/dev/null || true
+sudo pkill -9 -f run_tpu.py 2>/dev/null || pkill -9 -f run_tpu.py 2>/dev/null || true
 # Kill training python (but not system python)
-for pid in $(pgrep -f 'python3.*run_tpu\|python3.*train_tpu\|python3.*babysitter' 2>/dev/null); do
-    kill -9 "$pid" 2>/dev/null || true
+for pid in $(sudo pgrep -f 'python3.*run_tpu\|python3.*train_tpu\|python3.*babysitter' 2>/dev/null || pgrep -f 'python3.*run_tpu\|python3.*train_tpu\|python3.*babysitter' 2>/dev/null); do
+    sudo kill -9 "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
 done
 # Kill the flock wrapper (holds /tmp/tpu_babysitter.lock even after babysitter.py dies)
-pkill -9 -f 'flock.*tpu_babysitter' 2>/dev/null || true
+sudo pkill -9 -f 'flock.*tpu_babysitter' 2>/dev/null || pkill -9 -f 'flock.*tpu_babysitter' 2>/dev/null || true
 # Remove stale lock file so flock --timeout=30 doesn't wait unnecessarily
-rm -f /tmp/tpu_babysitter.lock
+sudo rm -f /tmp/tpu_babysitter.lock 2>/dev/null || rm -f /tmp/tpu_babysitter.lock 2>/dev/null || true
+# Reset log file ownership so future deploys can write to them
+sudo rm -f /tmp/babysitter.log /tmp/babysitter_chip*.log /tmp/boot_state.json 2>/dev/null || true
+# Note: do NOT remove /tmp/deploy_babysitter.log here — it was opened at startup via exec >>
 sleep 3
 
 report_phase "RELEASING_DEVICES"
@@ -151,76 +161,231 @@ elif ls /dev/vfio/[0-9]* >/dev/null 2>&1; then
     echo "Detected: v5e VM (/dev/vfio/[0-9]* devices)"
 fi
 
-# For v4 VMs: install torch+torch_xla from GCS tpu_core wheels if missing
-if $IS_V4 && ! python3 -c "import torch" 2>/dev/null; then
-    report_phase "INSTALLING_V4_TORCH"
-    echo "v4 VM: torch missing — installing from tpu_core wheels..."
-    mkdir -p /tmp/tpu_core
-    gsutil -m cp "gs://gcp-researchcredits-blocklab-1-us-central2/wheels/tpu_core/*.whl" /tmp/tpu_core/ 2>/dev/null || true
-    pip install /tmp/tpu_core/libtpu-*.whl --no-deps 2>/dev/null || true
-    pip install /tmp/tpu_core/torch-*.whl --no-deps 2>/dev/null || true
-    pip install /tmp/tpu_core/torch_xla-*.whl --no-deps 2>/dev/null || true
-    python3 -c "import torch" 2>/dev/null && echo "v4 torch OK" || echo "ERROR: v4 torch still missing"
-fi
+# ── Torch/TPU installation ────────────────────────────────────────────────────
+# Strategy by VM type:
+# - v6e ew4a: v2-alpha-tpuv6e runtime ships torch 2.9.0 + real nvidia CUDA libs in /usr/local/.
+#             torch imports via DT_RPATH finding real libcudart.so.12 in nvidia/ → no stubs needed.
+# - v6e ue1d: newer v2-alpha-tpuv6e image has NO torch. PyPI torch 2.9.0 requires Python 3.11+
+#             for nvidia-* deps, so PyPI install fails. Install from pre-downloaded GCS wheels
+#             (torch-2.9.0-cp310, torch_xla-2.9.0-cp310, libtpu-0.0.2, small deps).
+#             Then create CUDA stubs in /usr/local/.../nvidia/ (matching torch's DT_RPATH).
+# - v4/v5e: install torch+torch_xla+libtpu from GCS tpu_core wheels.
 
-# For v6e/v5e VMs: torch+torch_xla should be pre-installed at system level.
-# First clear any user-local shadow installs, then check if system torch is visible.
-# Only attempt pip install if clearing the shadow wasn't sufficient.
-if ($IS_V6E || $IS_V5E) && ! python3 -c "import torch; import torch_xla" 2>/dev/null; then
-    echo "v6e/v5e VM: torch/torch_xla not importable — clearing user-local shadow..."
-    # IMPORTANT: only remove user-local installs, not system torch
-    rm -rf ~/.local/lib/python3.10/site-packages/torch* 2>/dev/null || true
-    rm -rf ~/.local/lib/python3.10/site-packages/nvidia* 2>/dev/null || true
-    rm -rf ~/.local/lib/python3.10/site-packages/triton* 2>/dev/null || true
-    rm -rf ~/.local/lib/python3.10/site-packages/libtpu* 2>/dev/null || true
-    rm -rf ~/.cache/pip 2>/dev/null || true
-
-    # Re-check: clearing the shadow may be enough if system torch is intact
-    if python3 -c "import torch; import torch_xla" 2>/dev/null; then
-        echo "v6e torch OK (system install restored after clearing user shadow)"
+if [ "$IS_V6E" = "true" ]; then
+    # Check without torch_xla.device() — libtpu not set yet, calling .device() would fail even on ew4a.
+    # Only check importability: ew4a has torch+torch_xla in /usr/local/ → passes; ue1d has nothing → fails.
+    if PYTHONNOUSERSITE=1 python3 -c "import torch; import torch_xla" 2>/dev/null; then
+        echo "v6e: torch+torch_xla importable (system-wide) -- skipping install"
     else
-        report_phase "INSTALLING_V6E_TORCH"
-        echo "v6e/v5e VM: system torch missing — installing from libtpu-releases..."
-        # CRITICAL: use -f (find-links), NOT --index-url.
-        # libtpu-releases is a find-links page (not PEP 503 index) — --index-url silently fails.
-        # -f lets pip use both PyPI and libtpu-releases; libtpu torch wheel wins over CUDA torch
-        # because it matches the platform (no CUDA on TPU hosts).
-        pip install torch==2.9.0 torch_xla==2.9.0 \
-            -f https://storage.googleapis.com/libtpu-releases/index.html 2>&1 | tail -5 || {
-        echo "pip failed (no internet?) — trying GCS torch_tpu_wheels bundle..."
-        # Fallback for no-internet zones (us-east1-d, us-central1-a)
-        mkdir -p /tmp/torch_tpu_wheels
-        gsutil cp "${BUCKET}/wheels/torch_tpu_wheels.tar.gz" /tmp/torch_tpu_wheels.tar.gz 2>/dev/null || \
-            gsutil cp "gs://gcp-researchcredits-blocklab-us-east1/wheels/torch_tpu_wheels.tar.gz" \
-                /tmp/torch_tpu_wheels.tar.gz 2>/dev/null || true
-        if [ -f /tmp/torch_tpu_wheels.tar.gz ]; then
-            tar xzf /tmp/torch_tpu_wheels.tar.gz -C /tmp/torch_tpu_wheels/ 2>/dev/null || true
-            # Archive may unpack to a subdirectory — find wheels recursively
-            # Install torch+torch_xla+libtpu (order: libtpu→torch→torch_xla)
-            # Step 1: Install libtpu from GCS pkg (no wheel needed — direct copy to site-packages)
-            if ! python3 -c "import libtpu" 2>/dev/null; then
-                mkdir -p /tmp/libtpu_install
-                gsutil cp "${BUCKET}/wheels/libtpu_pkg.tar.gz" /tmp/libtpu_pkg.tar.gz 2>/dev/null || true
-                if [ -f /tmp/libtpu_pkg.tar.gz ]; then
-                    SITE_PKG=$(python3 -c "import site; print(site.getusersitepackages())")
-                    mkdir -p "$SITE_PKG"
-                    tar xzf /tmp/libtpu_pkg.tar.gz -C "$SITE_PKG" 2>/dev/null || true
-                    python3 -c "import libtpu" 2>/dev/null && echo "libtpu installed from pkg" || echo "libtpu still missing"
+        report_phase "INSTALLING_TPU_TORCH"
+        echo "v6e: torch+torch_xla not found in /usr/local/. Installing from GCS wheels..."
+
+        # Remove any stale CUDA torch from ~/.local/ that might shadow the correct system install
+        _kw_sp="${HOME}/.local/lib/python3.10/site-packages"
+        if ls "${_kw_sp}"/torch-*.dist-info 2>/dev/null | grep -q .; then
+            echo "  Removing stale user torch from ~/.local/..."
+            rm -rf "${_kw_sp}"/torch "${_kw_sp}"/torch-*.dist-info "${_kw_sp}"/torchgen 2>/dev/null || true
+        fi
+
+        # Install torch+torch_xla from pre-built GCS wheels.
+        # PyPI torch 2.9.0 requires nvidia-*-cu12 which need Python 3.11+ (can't use pip install on 3.10).
+        # Wheels at gs://.../wheels/torch_v6e_cp310/ are pre-downloaded cp310 builds from PyPI + libtpu-0.0.2.
+        # storage.googleapis.com is reachable from all zones (Private Google Access); pypi.org is not on ue1d.
+        if ! PYTHONNOUSERSITE=1 python3 -c "import torch_xla" 2>/dev/null; then
+            echo "  Downloading torch wheels from GCS..."
+            _whl_bucket="${BUCKET}/wheels/torch_v6e_cp310"
+            _whl_dir="/tmp/torch_v6e_wheels"
+            mkdir -p "$_whl_dir"
+            # snap gsutil needs its user data dir; startup script runs as root which can create root-owned dirs.
+            # Fix: chown snap dir to current user, or use sudo gsutil when non-root.
+            _gsutil="gsutil"
+            if [ "$(id -u)" != "0" ]; then
+                sudo chown -R "$(id -un):$(id -gn)" "${HOME}/snap/google-cloud-cli" 2>/dev/null || true
+                # If still failing, use sudo gsutil as fallback
+                gsutil version 2>/dev/null || _gsutil="sudo gsutil"
+            fi
+            $_gsutil -m cp "${_whl_bucket}/*.whl" "$_whl_dir/" 2>&1 | grep -v 'crcmod' | tail -3 || echo "WARNING: GCS wheel download failed"
+
+            if ls "$_whl_dir"/torch-*.whl 2>/dev/null | head -1 | grep -q .; then
+                _pip="pip3"
+                [ "$(id -u)" != "0" ] && _pip="sudo pip3"
+
+                # Small deps first (safe to install with deps, they're tiny pure-python)
+                $_pip install \
+                    "$_whl_dir"/filelock*.whl \
+                    "$_whl_dir"/typing_extensions*.whl \
+                    "$_whl_dir"/sympy*.whl \
+                    "$_whl_dir"/mpmath*.whl \
+                    "$_whl_dir"/networkx*.whl \
+                    "$_whl_dir"/jinja2*.whl \
+                    "$_whl_dir"/markupsafe*.whl \
+                    "$_whl_dir"/fsspec*.whl \
+                    --no-deps -q 2>&1 | tail -2 || true
+
+                # Install torch + torch_xla with --no-deps (avoids nvidia-*-cu12 deps, need Python 3.11+)
+                $_pip install "$_whl_dir"/torch-*.whl --no-deps -q 2>&1 | tail -2 || true
+                $_pip install "$_whl_dir"/torch_xla-*.whl --no-deps -q 2>&1 | tail -2 || true
+
+                # Install libtpu to ~/.local/ (py3-none wheel, any Python 3; provides libtpu.so)
+                pip3 install --user "$_whl_dir"/libtpu-0.0.2*.whl --no-deps -q 2>&1 | tail -2 || true
+
+                # Install typing_extensions separately (required by torch at import; not a dep of torch_xla whl).
+                # Use --force-reinstall to ensure it lands in /usr/local/ even if another version is present.
+                PYTHONNOUSERSITE=1 python3 -c "import typing_extensions" 2>/dev/null || \
+                    $_pip install "$_whl_dir"/typing_extensions*.whl --no-deps --force-reinstall -q 2>&1 | tail -2 || true
+                # Verify torch importable now
+                PYTHONNOUSERSITE=1 python3 -c "import torch; print('torch', torch.__version__)" 2>/dev/null || \
+                    echo "WARNING: torch still not importable after typing_extensions install"
+
+                echo "  GCS wheel install complete"
+                rm -rf "$_whl_dir"
+            else
+                echo "  ERROR: torch wheels not found after GCS download"
+            fi
+        fi
+
+        # Create CUDA stub libs so torch imports succeed (TPU never uses CUDA).
+        # Stubs in /usr/local/.../nvidia/ match torch's DT_RPATH — first ctypes.CDLL succeeds directly.
+        _nv="/usr/local/lib/python3.10/dist-packages/nvidia"
+        if [ "$(id -u)" = "0" ]; then
+            mkdir -p "${_nv}"
+            touch "${_nv}/__init__.py" 2>/dev/null || true
+        else
+            sudo mkdir -p "${_nv}" && sudo touch "${_nv}/__init__.py" 2>/dev/null || true
+        fi
+
+        _make_stub() {
+            local pkg="$1" lib="$2"
+            local dir="${_nv}/${pkg}/lib"
+            if [ "$(id -u)" = "0" ]; then
+                mkdir -p "$dir"
+                touch "${_nv}/${pkg}/__init__.py" 2>/dev/null || true
+                if [ ! -f "$dir/$lib" ]; then
+                    printf 'void _stub(void) {}' | gcc -shared -fPIC -Wl,-soname,"$lib" -o "$dir/$lib" -x c - 2>/dev/null && echo "  stub: $lib" || echo "  WARN: gcc stub failed for $lib"
+                fi
+            else
+                sudo mkdir -p "$dir" && sudo touch "${_nv}/${pkg}/__init__.py" 2>/dev/null || true
+                if [ ! -f "$dir/$lib" ]; then
+                    printf 'void _stub(void) {}' | sudo tee /tmp/stub_src.c > /dev/null && sudo gcc -shared -fPIC -Wl,-soname,"$lib" -o "$dir/$lib" /tmp/stub_src.c 2>/dev/null && echo "  stub: $lib" || { printf 'void _stub(void) {}' | sudo bash -c "gcc -shared -fPIC -Wl,-soname,\"$lib\" -o \"$dir/$lib\" -x c - 2>/dev/null" && echo "  stub: $lib" || echo "  WARN: gcc stub failed for $lib"; }
                 fi
             fi
-            # Step 2: torch and torch_xla (--no-deps to avoid CUDA deps from PyPI)
-            find /tmp/torch_tpu_wheels -name 'torch-*.whl' | while read whl; do
-                pip install "$whl" --no-deps 2>/dev/null || true
-            done
-            find /tmp/torch_tpu_wheels -name 'torch_xla*.whl' | while read whl; do
-                pip install "$whl" --no-deps 2>/dev/null || true
-            done
+        }
+
+        # Correct sonames verified from ew4a nvidia/ dir (torch 2.9.0+cu128)
+        _make_stub cublas          libcublas.so.12
+        _make_stub cublas          libcublasLt.so.12
+        _make_stub cublas          libnvblas.so.12
+        _make_stub cuda_cupti      libcupti.so.12
+        _make_stub cuda_nvrtc      libnvrtc.so.12
+        _make_stub cuda_runtime    libcudart.so.12
+        _make_stub cudnn            libcudnn.so.9
+        _make_stub cudnn            libcudnn_adv.so.9
+        _make_stub cudnn            libcudnn_cnn.so.9
+        _make_stub cudnn            libcudnn_engines_precompiled.so.9
+        _make_stub cudnn            libcudnn_engines_runtime_compiled.so.9
+        _make_stub cudnn            libcudnn_graph.so.9
+        _make_stub cudnn            libcudnn_heuristic.so.9
+        _make_stub cudnn            libcudnn_ops.so.9
+        _make_stub cufft            libcufft.so.11
+        _make_stub cufft            libcufftw.so.11
+        _make_stub cufile            libcufile.so.0
+        _make_stub curand            libcurand.so.10
+        _make_stub cusolver          libcusolver.so.11
+        _make_stub cusparse          libcusparse.so.12
+        _make_stub cusparselt        libcusparseLt.so.0
+        _make_stub nccl              libnccl.so.2
+        _make_stub nvjitlink         libnvJitLink.so.12
+        _make_stub nvshmem           libnvshmem_host.so.3
+        _make_stub nvtx              libnvToolsExt.so.1
+
+        # Verify with PYTHONNOUSERSITE=1 (same as babysitter)
+        _import_test=$(PYTHONNOUSERSITE=1 python3 -c "import torch_xla; print('OK found_libtpu=' + str(torch_xla._found_libtpu))" 2>&1)
+        echo "torch_xla (PYTHONNOUSERSITE=1): $_import_test"
+        echo "$_import_test" | grep -q "^OK" || echo "WARNING: torch_xla still broken after setup"
+    fi
+else
+    # v4/v5e: install tpu_core wheels if needed
+    _NEEDS_TPU_TORCH=false
+    python3 -c "import torch; import torch_xla" 2>/dev/null || _NEEDS_TPU_TORCH=true
+    # Wrong: CUDA torch -- check via dist-info metadata (import fails, can't use torch.__version__)
+    _usp="$HOME/.local/lib/python3.10/site-packages"
+    for _meta in "${_usp}"/torch-*.dist-info/METADATA /usr/local/lib/python3.10/dist-packages/torch-*.dist-info/METADATA; do
+        [ -f "$_meta" ] || continue
+        grep -q '+cu\|nvidia\|cuda' "$_meta" 2>/dev/null && { echo "CUDA torch detected: $_meta"; _NEEDS_TPU_TORCH=true; break; }
+    done
+    python3 -c "import torch_xla; exit(0 if torch_xla._found_libtpu else 1)" 2>/dev/null || _NEEDS_TPU_TORCH=true
+    echo "TPU_TORCH_NEEDED=$_NEEDS_TPU_TORCH"
+
+    if [ "$_NEEDS_TPU_TORCH" = "true" ]; then
+        report_phase "INSTALLING_TPU_TORCH"
+        echo "Installing TPU torch+torch_xla+libtpu from GCS tpu_core wheels..."
+        if ls "${_usp}"/torch-*.dist-info 2>/dev/null | grep -q .; then
+            echo "Removing existing torch from ~/.local/..."
+            rm -rf "${_usp}"/torch "${_usp}"/torch-*.dist-info "${_usp}"/torchgen \
+                   "${_usp}"/torch_xla "${_usp}"/torch_xla-*.dist-info \
+                   "${_usp}"/nvidia 2>/dev/null || true
         fi
-    }
-        python3 -c "import torch; import torch_xla" 2>/dev/null && echo "v6e torch OK" || \
-            echo "ERROR: v6e torch still missing after install attempt"
-    fi  # end: system torch missing branch
-fi  # end: v6e/v5e torch check
+        rm -rf /tmp/tpu_core && mkdir -p /tmp/tpu_core
+        gsutil -m cp "gs://gcp-researchcredits-blocklab-europe-west4/wheels/tpu_core/*.whl" /tmp/tpu_core/ 2>/dev/null || \
+            gsutil -m cp "gs://gcp-researchcredits-blocklab-1-us-central2/wheels/tpu_core/*.whl" /tmp/tpu_core/ 2>/dev/null || \
+            gsutil -m cp "gs://gcp-researchcredits-blocklab-us-east1/wheels/tpu_core/*.whl" /tmp/tpu_core/ 2>/dev/null || true
+        if ls /tmp/tpu_core/*.whl >/dev/null 2>&1; then
+            pip install /tmp/tpu_core/libtpu-*.whl --force-reinstall --no-deps 2>/dev/null && echo "libtpu installed" || echo "WARNING: libtpu install failed"
+            pip install /tmp/tpu_core/torch-*.whl --force-reinstall --no-deps 2>/dev/null && echo "torch installed" || echo "WARNING: torch install failed"
+            pip install /tmp/tpu_core/torch_xla-*.whl --force-reinstall --no-deps 2>/dev/null && echo "torch_xla installed" || echo "WARNING: torch_xla install failed"
+            pip install typing_extensions filelock jinja2 networkx sympy fsspec 2>/dev/null || true
+            python3 -c "import typing_extensions" 2>/dev/null || {
+                echo "typing_extensions missing -- installing from GCS wheels bundle..."
+                cd /tmp
+                [ -f /tmp/all_wheels.tar.gz ] || \
+                    gcloud storage cp "${BUCKET}/wheels/all_wheels.tar.gz" /tmp/all_wheels.tar.gz 2>/dev/null || \
+                    gsutil cp "${BUCKET}/wheels/all_wheels.tar.gz" /tmp/all_wheels.tar.gz 2>/dev/null || true
+                if [ -f /tmp/all_wheels.tar.gz ]; then
+                    tar xzf /tmp/all_wheels.tar.gz -C /tmp/ --wildcards '*/typing_extensions*.whl' 2>/dev/null || true
+                    whl=$(ls /tmp/all_wheels/typing_extensions*.whl 2>/dev/null | head -1)
+                    [ -n "$whl" ] && pip install "$whl" --no-deps 2>/dev/null && echo "typing_extensions installed from GCS" || true
+                fi
+            }
+        else
+            echo "ERROR: Could not download tpu_core wheels from any bucket"
+        fi
+        python3 -c "import torch_xla; print(f'torch_xla found_libtpu={torch_xla._found_libtpu}')" 2>/dev/null || echo "ERROR: torch_xla still broken after tpu_core install"
+    fi
+fi
+
+# Set TPU_LIBRARY_PATH so _XLAC C extension can find libtpu.so at runtime.
+# The Python libtpu package knows the .so location; _XLAC needs it via env var.
+if [ -z "${TPU_LIBRARY_PATH:-}" ]; then
+    _LIBTPU_SO=$(python3 -c "import libtpu; print(libtpu.get_library_path())" 2>/dev/null || true)
+    if [ -n "$_LIBTPU_SO" ] && [ -f "$_LIBTPU_SO" ]; then
+        export TPU_LIBRARY_PATH="$_LIBTPU_SO"
+        echo "TPU_LIBRARY_PATH=$TPU_LIBRARY_PATH"
+    else
+        echo "WARNING: could not determine libtpu.so path — XLA device init may fail"
+    fi
+fi
+
+# ── Hard TPU init gate ────────────────────────────────────────────────────────
+# This is the ONLY test that matters: can we actually initialize the XLA device?
+# Failures here (libtpu not found, PJRT errors, device busy) must stop deploy
+# before babysitter claims tasks and fails at runtime.
+report_phase "TESTING_TPU_INIT"
+_TPU_INIT_OK=false
+TPU_INIT_OUTPUT=$(python3 -c "
+import torch_xla
+d = torch_xla.device()
+print(f'TPU_INIT_OK device={d}')
+" 2>&1)
+echo "TPU init test: $TPU_INIT_OUTPUT"
+if echo "$TPU_INIT_OUTPUT" | grep -q "TPU_INIT_OK"; then
+    _TPU_INIT_OK=true
+    echo "✓ TPU device initialized successfully"
+else
+    echo "✗ TPU device init FAILED — cannot launch babysitter"
+    echo "  Output: $TPU_INIT_OUTPUT"
+    report_phase "FAILED_ENV_TPU_INIT"
+    exit 1
+fi
 
 # Install training-specific packages (all VM types)
 MISSING=""
@@ -320,26 +485,26 @@ gsutil cp "${BUCKET}/code/sf_bema_code.tar.gz" \
     tar xzf /tmp/sf_bema_code.tar.gz -C ~/sf_bema/experiments/ 2>/dev/null || true
 
 # ── Download training data ────────────────────────────────────────────────────
-DATA_DST=$HOME/sf_bema/experiments/exp10_smollm2_smoltalk/data
+DATA_DST=$HOME/sf_bema/experiments/exp10_smollm2_smoltalk/data_full
 if [ ! -d "${DATA_DST}/train" ]; then
     report_phase "DOWNLOADING_DATA"
-    echo "Downloading training data (~1.86GB)..."
+    echo "Downloading training data (full ~7GB)..."
     mkdir -p "$DATA_DST"
     # Use rsync-style for idempotency
-    gcloud storage cp -r "${BUCKET}/data/smoltalk/data/train" \
+    gcloud storage cp -r "${BUCKET}/data/smoltalk_full/data/train" \
         "$DATA_DST/" 2>/dev/null && \
-    gcloud storage cp -r "${BUCKET}/data/smoltalk/data/val" \
+    gcloud storage cp -r "${BUCKET}/data/smoltalk_full/data/val" \
         "$DATA_DST/" 2>/dev/null || \
-    gsutil -m cp -r "${BUCKET}/data/smoltalk/data/train" \
+    gsutil -m cp -r "${BUCKET}/data/smoltalk_full/data/train" \
         "$DATA_DST/" 2>/dev/null && \
-    gsutil -m cp -r "${BUCKET}/data/smoltalk/data/val" \
+    gsutil -m cp -r "${BUCKET}/data/smoltalk_full/data/val" \
         "$DATA_DST/" 2>/dev/null || true
     echo "Data: $(ls $DATA_DST 2>/dev/null | wc -l) dirs"
 fi
 
 # Symlink smoltalk data into every experiment work dir that needs it.
-# Data lives at exp10_smollm2_smoltalk/data (shared source of truth).
-DATA_SRC=~/sf_bema/experiments/exp10_smollm2_smoltalk/data
+# Data lives at exp10_smollm2_smoltalk/data_full (full 455k dataset).
+DATA_SRC=~/sf_bema/experiments/exp10_smollm2_smoltalk/data_full
 if [ -d "$DATA_SRC" ]; then
     for _wdir in ~/sf_bema/experiments/*/; do
         _name=$(basename "$_wdir")
@@ -428,10 +593,12 @@ export ACCELERATOR_TYPE=${ACCEL}
 export MODEL_PATH=/tmp/SmolLM2-135M
 export XLA_PERSISTENT_CACHE_PATH=${XLA_DIR}
 export XLA_COMPILATION_CACHE_PATH=${XLA_DIR}
+export TPU_LIBRARY_PATH=${TPU_LIBRARY_PATH:-}
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1
 export CHIPS_PER_HOST=${CHIPS}
 export GCS_CHECKPOINT_DIR=${BUCKET}/checkpoints  # babysitter.py appends /{exp_name}
 

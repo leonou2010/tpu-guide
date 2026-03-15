@@ -12,6 +12,9 @@
 set -uo pipefail
 
 # ── Redirect own output to deploy log ────────────────────────────────────────
+# Must remove stale/root-owned logs BEFORE redirects (redirect fails if not writable)
+sudo rm -f /tmp/deploy_babysitter.log /tmp/babysitter.log 2>/dev/null || \
+    rm -f /tmp/deploy_babysitter.log /tmp/babysitter.log 2>/dev/null || true
 exec >> /tmp/deploy_babysitter.log 2>&1
 echo "=== deploy_babysitter.sh started at $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
 
@@ -19,7 +22,24 @@ echo "=== deploy_babysitter.sh started at $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==
 export HOME=${HOME:-/root}
 
 # ── PATH ─────────────────────────────────────────────────────────────────────
-export PATH=$HOME/.local/bin:$HOME/miniconda3/bin:/usr/local/bin:/usr/bin:/usr/sbin:$PATH
+#
+# IMPORTANT: Prefer system Python on TPU VM images.
+# Conda Python frequently leads to pip installing CUDA torch wheels (e.g. 2.9.0+cu128),
+# which can break torch_xla / libtpu behavior on TPU hosts.
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:$HOME/.local/bin:$PATH
+
+PYTHON_BIN=$(command -v python3 2>/dev/null || true)
+if [ -z "$PYTHON_BIN" ]; then
+    echo "ERROR: python3 not found on PATH"
+    exit 1
+fi
+echo "Using python3: $PYTHON_BIN ($($PYTHON_BIN -V 2>/dev/null || true))"
+
+PIP_INSTALL=("$PYTHON_BIN" -m pip install)
+if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+    echo "ERROR: pip not available for $PYTHON_BIN"
+    exit 1
+fi
 
 # ── Early var detection (before TPU_NAME/ZONE are resolved) ──────────────────
 # Auto-detect ZONE first (needed for BUCKET)
@@ -49,6 +69,8 @@ report_phase() {
     local phase=$1
     local ts
     ts=$(date +%s)
+    # Remove stale root-owned file before writing (permission denied otherwise)
+    sudo rm -f /tmp/boot_state.json 2>/dev/null || rm -f /tmp/boot_state.json 2>/dev/null || true
     printf '{"tpu_name":"%s","zone":"%s","phase":"%s","timestamp":%s}\n' \
         "$TPU_NAME" "${ZONE:-}" "$phase" "$ts" > /tmp/boot_state.json
     # Best-effort upload — don't fail if GCS unreachable
@@ -113,16 +135,19 @@ done
 pkill -9 -f 'flock.*tpu_babysitter' 2>/dev/null || true
 # Remove stale lock file so flock --timeout=30 doesn't wait unnecessarily
 rm -f /tmp/tpu_babysitter.lock
+# Fix root-owned /tmp/ckpts from previous root babysitter — prevents checkpoint save failures
+_cur_user=$(id -un 2>/dev/null || echo "${USER:-kwokchunau}")
+sudo chown -R "${_cur_user}:${_cur_user}" /tmp/ckpts/ 2>/dev/null || true
 sleep 3
 
 report_phase "RELEASING_DEVICES"
 
 # Release TPU device locks
-for dev in /dev/vfio/[0-9]* /dev/accel[0-9]*; do
+for dev in /dev/vfio/devices/vfio[0-9]* /dev/vfio/[0-9]* /dev/accel[0-9]*; do
     [ -e "$dev" ] && fuser -k "$dev" 2>/dev/null || true
 done
 sleep 2
-for dev in /dev/vfio/[0-9]* /dev/accel[0-9]*; do
+for dev in /dev/vfio/devices/vfio[0-9]* /dev/vfio/[0-9]* /dev/accel[0-9]*; do
     [ -e "$dev" ] && fuser -k -9 "$dev" 2>/dev/null || true
 done
 sleep 2
@@ -152,95 +177,80 @@ elif ls /dev/vfio/[0-9]* >/dev/null 2>&1; then
 fi
 
 # For v4 VMs: install torch+torch_xla from GCS tpu_core wheels if missing
-if $IS_V4 && ! python3 -c "import torch" 2>/dev/null; then
+if $IS_V4 && ! "${PYTHON_BIN}" -c "import torch" 2>/dev/null; then
     report_phase "INSTALLING_V4_TORCH"
     echo "v4 VM: torch missing — installing from tpu_core wheels..."
     mkdir -p /tmp/tpu_core
     gsutil -m cp "gs://gcp-researchcredits-blocklab-1-us-central2/wheels/tpu_core/*.whl" /tmp/tpu_core/ 2>/dev/null || true
-    pip install /tmp/tpu_core/libtpu-*.whl --no-deps 2>/dev/null || true
-    pip install /tmp/tpu_core/torch-*.whl --no-deps 2>/dev/null || true
-    pip install /tmp/tpu_core/torch_xla-*.whl --no-deps 2>/dev/null || true
-    python3 -c "import torch" 2>/dev/null && echo "v4 torch OK" || echo "ERROR: v4 torch still missing"
+    "${PIP_INSTALL[@]}" /tmp/tpu_core/libtpu-*.whl --no-deps 2>/dev/null || true
+    "${PIP_INSTALL[@]}" /tmp/tpu_core/torch-*.whl --no-deps 2>/dev/null || true
+    "${PIP_INSTALL[@]}" /tmp/tpu_core/torch_xla-*.whl --no-deps 2>/dev/null || true
+    "${PYTHON_BIN}" -c "import torch" 2>/dev/null && echo "v4 torch OK" || echo "ERROR: v4 torch still missing"
 fi
 
-# For v6e/v5e VMs: torch+torch_xla should be pre-installed at system level.
-# First clear any user-local shadow installs, then check if system torch is visible.
-# Only attempt pip install if clearing the shadow wasn't sufficient.
-if ($IS_V6E || $IS_V5E) && ! python3 -c "import torch; import torch_xla" 2>/dev/null; then
-    echo "v6e/v5e VM: torch/torch_xla not importable — clearing user-local shadow..."
-    # IMPORTANT: only remove user-local installs, not system torch
-    rm -rf ~/.local/lib/python3.10/site-packages/torch* 2>/dev/null || true
-    rm -rf ~/.local/lib/python3.10/site-packages/nvidia* 2>/dev/null || true
-    rm -rf ~/.local/lib/python3.10/site-packages/triton* 2>/dev/null || true
-    rm -rf ~/.local/lib/python3.10/site-packages/libtpu* 2>/dev/null || true
-    rm -rf ~/.cache/pip 2>/dev/null || true
+# For v6e/v5e VMs: ensure the system torch is used, never a user-site CUDA shadow.
+# A torch with +cu in the version string, or loaded from ~/.local/, is a PyPI CUDA wheel that
+# was pip-installed to user-site and shadows the system torch — this can break torch_xla/libtpu.
+# Fix: purge user-site copies; the system torch at /usr/local/lib/python3.X/dist-packages/ is correct.
+if $IS_V6E || $IS_V5E; then
+    _torch_v=$("${PYTHON_BIN}" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "")
+    _torch_file=$("${PYTHON_BIN}" -c "import torch; print(torch.__file__)" 2>/dev/null || echo "")
+    echo "v6e torch: ${_torch_v:-not importable} @ ${_torch_file:-?}"
 
-    # Re-check: clearing the shadow may be enough if system torch is intact
-    if python3 -c "import torch; import torch_xla" 2>/dev/null; then
-        echo "v6e torch OK (system install restored after clearing user shadow)"
-    else
+    # Purge user-site shadow if torch has +cu suffix or is loaded from ~/.local/
+    if echo "${_torch_v}${_torch_file}" | grep -qE '\+cu|/\.local/'; then
+        echo "v6e: user-site/CUDA torch detected — purging ~/.local shadow..."
+        _py_ver=$("${PYTHON_BIN}" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.10")
+        rm -rf "${HOME}/.local/lib/python${_py_ver}/site-packages/torch"* \
+               "${HOME}/.local/lib/python${_py_ver}/site-packages/torch_xla"* \
+               "${HOME}/.local/lib/python${_py_ver}/site-packages/libtpu"* 2>/dev/null || true
+        _torch_v=$("${PYTHON_BIN}" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "")
+        _torch_file=$("${PYTHON_BIN}" -c "import torch; print(torch.__file__)" 2>/dev/null || echo "")
+        echo "v6e torch after cleanup: ${_torch_v:-not importable} @ ${_torch_file:-?}"
+    fi
+
+    # Only install torch/torch_xla if still missing after cleanup
+    if ! "${PYTHON_BIN}" -c "import torch; import torch_xla" 2>/dev/null; then
         report_phase "INSTALLING_V6E_TORCH"
-        echo "v6e/v5e VM: system torch missing — installing from libtpu-releases..."
-        # CRITICAL: use -f (find-links), NOT --index-url.
-        # libtpu-releases is a find-links page (not PEP 503 index) — --index-url silently fails.
-        # -f lets pip use both PyPI and libtpu-releases; libtpu torch wheel wins over CUDA torch
-        # because it matches the platform (no CUDA on TPU hosts).
-        pip install torch==2.9.0 torch_xla==2.9.0 \
-            -f https://storage.googleapis.com/libtpu-releases/index.html 2>&1 | tail -5 || {
-        echo "pip failed (no internet?) — trying GCS torch_tpu_wheels bundle..."
-        # Fallback for no-internet zones (us-east1-d, us-central1-a)
-        mkdir -p /tmp/torch_tpu_wheels
-        gsutil cp "${BUCKET}/wheels/torch_tpu_wheels.tar.gz" /tmp/torch_tpu_wheels.tar.gz 2>/dev/null || \
-            gsutil cp "gs://gcp-researchcredits-blocklab-us-east1/wheels/torch_tpu_wheels.tar.gz" \
-                /tmp/torch_tpu_wheels.tar.gz 2>/dev/null || true
-        if [ -f /tmp/torch_tpu_wheels.tar.gz ]; then
-            tar xzf /tmp/torch_tpu_wheels.tar.gz -C /tmp/torch_tpu_wheels/ 2>/dev/null || true
-            # Archive may unpack to a subdirectory — find wheels recursively
-            # Install torch+torch_xla+libtpu (order: libtpu→torch→torch_xla)
-            # Step 1: Install libtpu from GCS pkg (no wheel needed — direct copy to site-packages)
-            if ! python3 -c "import libtpu" 2>/dev/null; then
-                mkdir -p /tmp/libtpu_install
-                gsutil cp "${BUCKET}/wheels/libtpu_pkg.tar.gz" /tmp/libtpu_pkg.tar.gz 2>/dev/null || true
-                if [ -f /tmp/libtpu_pkg.tar.gz ]; then
-                    SITE_PKG=$(python3 -c "import site; print(site.getusersitepackages())")
-                    mkdir -p "$SITE_PKG"
-                    tar xzf /tmp/libtpu_pkg.tar.gz -C "$SITE_PKG" 2>/dev/null || true
-                    python3 -c "import libtpu" 2>/dev/null && echo "libtpu installed from pkg" || echo "libtpu still missing"
-                fi
-            fi
-            # Step 2: torch and torch_xla (--no-deps to avoid CUDA deps from PyPI)
-            find /tmp/torch_tpu_wheels -name 'torch-*.whl' | while read whl; do
-                pip install "$whl" --no-deps 2>/dev/null || true
-            done
-            find /tmp/torch_tpu_wheels -name 'torch_xla*.whl' | while read whl; do
-                pip install "$whl" --no-deps 2>/dev/null || true
-            done
-        fi
-    }
-        python3 -c "import torch; import torch_xla" 2>/dev/null && echo "v6e torch OK" || \
-            echo "ERROR: v6e torch still missing after install attempt"
-    fi  # end: system torch missing branch
+        echo "v6e/v5e VM: torch/torch_xla missing — installing system-wide (no --user)..."
+        # No --user: avoid creating another user-site shadow. torch_xla from libtpu-releases.
+        sudo "${PYTHON_BIN}" -m pip install torch==2.9.0 torch_xla==2.9.0 \
+            -f https://storage.googleapis.com/libtpu-releases/index.html 2>&1 | tail -5
+        _torch_v=$("${PYTHON_BIN}" -c "import torch; import torch_xla; print(torch.__version__, torch.__file__)" 2>/dev/null || echo "FAILED")
+        echo "v6e torch after install: $_torch_v"
+    fi
+
+    # Always ensure libtpu is installed on v6e/v5e — system torch_xla may import but
+    # the C extension needs libtpu.so path at runtime (via TPU_LIBRARY_PATH).
+    # System torch_xla from PyPI does NOT bundle libtpu.so; it must be installed separately.
+    if ! "${PYTHON_BIN}" -c "import libtpu" 2>/dev/null; then
+        echo "v6e: libtpu not found — installing from libtpu-releases..."
+        sudo "${PYTHON_BIN}" -m pip install libtpu \
+            -f https://storage.googleapis.com/libtpu-releases/index.html 2>&1 | tail -3 || true
+        "${PYTHON_BIN}" -c "import libtpu; print('libtpu installed at:', libtpu.get_library_path())" 2>/dev/null || \
+            echo "WARNING: libtpu still not importable after install"
+    fi
 fi  # end: v6e/v5e torch check
 
 # Install training-specific packages (all VM types)
 MISSING=""
-python3 -c "import hydra" 2>/dev/null || MISSING="$MISSING hydra"
-python3 -c "import transformers" 2>/dev/null || MISSING="$MISSING transformers"
-python3 -c "import sympy" 2>/dev/null || MISSING="$MISSING sympy"
-python3 -c "import antlr4" 2>/dev/null || MISSING="$MISSING antlr4"
-python3 -c "import datasets" 2>/dev/null || MISSING="$MISSING datasets"
-python3 -c "import wandb" 2>/dev/null || MISSING="$MISSING wandb"
+"${PYTHON_BIN}" -c "import hydra" 2>/dev/null || MISSING="$MISSING hydra"
+"${PYTHON_BIN}" -c "import transformers" 2>/dev/null || MISSING="$MISSING transformers"
+"${PYTHON_BIN}" -c "import sympy" 2>/dev/null || MISSING="$MISSING sympy"
+"${PYTHON_BIN}" -c "import antlr4" 2>/dev/null || MISSING="$MISSING antlr4"
+"${PYTHON_BIN}" -c "import datasets" 2>/dev/null || MISSING="$MISSING datasets"
+"${PYTHON_BIN}" -c "import wandb" 2>/dev/null || MISSING="$MISSING wandb"
 
 if [ -n "$MISSING" ]; then
     report_phase "INSTALLING_PACKAGES"
     echo "Missing:$MISSING — installing..."
     # Try pip first (works on internet VMs)
     # antlr4-python3-runtime==4.9.3 needs setuptools<70 (newer setuptools breaks setup.py)
-    pip install 'setuptools<70' 2>/dev/null || true
-    pip install antlr4-python3-runtime==4.9.3 2>/dev/null || true
-    pip install hydra-core omegaconf transformers sympy datasets wandb 2>/dev/null || true
+    "${PIP_INSTALL[@]}" 'setuptools<70' 2>/dev/null || true
+    "${PIP_INSTALL[@]}" antlr4-python3-runtime==4.9.3 2>/dev/null || true
+    "${PIP_INSTALL[@]}" hydra-core omegaconf transformers sympy datasets wandb 2>/dev/null || true
     # Fallback: install from GCS wheels (no-internet VMs)
-    python3 -c "import transformers" 2>/dev/null || {
+    "${PYTHON_BIN}" -c "import transformers" 2>/dev/null || {
         echo "pip failed — installing from GCS wheels bundle..."
         cd /tmp
         gcloud storage cp "${BUCKET}/wheels/all_wheels.tar.gz" /tmp/all_wheels.tar.gz 2>/dev/null || \
@@ -254,7 +264,7 @@ if [ -n "$MISSING" ]; then
                 name=$(basename "$whl" | tr '-' ' ' | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
                 case "$name" in
                     torch*|nvidia*|libtpu*|jax*|triton*) continue ;;
-                    *) pip install "$whl" --no-deps 2>/dev/null || true ;;
+                    *) "${PIP_INSTALL[@]}" "$whl" --no-deps 2>/dev/null || true ;;
                 esac
             done
         fi
@@ -266,20 +276,21 @@ report_phase "PRE_FLIGHT_CHECK"
 echo "Running pre-flight assertions..."
 
 ASSERT_ERRORS=""
-python3 -c "import torch; import torch_xla" 2>/dev/null || ASSERT_ERRORS="$ASSERT_ERRORS torch/torch_xla"
-python3 -c "import transformers" 2>/dev/null || ASSERT_ERRORS="$ASSERT_ERRORS transformers"
-python3 -c "import hydra" 2>/dev/null || ASSERT_ERRORS="$ASSERT_ERRORS hydra"
+"${PYTHON_BIN}" -c "import torch; import torch_xla" 2>/dev/null || ASSERT_ERRORS="$ASSERT_ERRORS torch/torch_xla"
+"${PYTHON_BIN}" -c "import transformers" 2>/dev/null || ASSERT_ERRORS="$ASSERT_ERRORS transformers"
+"${PYTHON_BIN}" -c "import hydra" 2>/dev/null || ASSERT_ERRORS="$ASSERT_ERRORS hydra"
 
 if [ -n "$ASSERT_ERRORS" ]; then
     echo "PRE_FLIGHT FAILED: missing$ASSERT_ERRORS"
     report_phase "FAILED_ENV:$ASSERT_ERRORS"
     # Write structured error to GCS for monitoring
+    sudo rm -f /tmp/boot_state.json 2>/dev/null || rm -f /tmp/boot_state.json 2>/dev/null || true
     printf '{"tpu_name":"%s","phase":"FAILED_ENV","missing":"%s","timestamp":%s}\n' \
         "$TPU_NAME" "$ASSERT_ERRORS" "$(date +%s)" > /tmp/boot_state.json
     gsutil cp /tmp/boot_state.json "$CTRL/telemetry/${TPU_NAME}_boot.json" 2>/dev/null || true
     exit 1
 fi
-echo "Pre-flight OK: torch=$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null)"
+echo "Pre-flight OK: torch=$("${PYTHON_BIN}" -c 'import torch; print(torch.__version__, torch.__file__)' 2>/dev/null)"
 
 # ── Download model ────────────────────────────────────────────────────────────
 MODEL_PATH=/tmp/SmolLM2-135M
@@ -398,15 +409,21 @@ fi
 
 echo "Zone=$ZONE, Bucket=$BUCKET, Chips=$CHIPS, Accel=$ACCEL"
 
-# Verify devices are free
-for chip in $(seq 0 $((CHIPS-1))); do
-    if ls /dev/vfio/${chip} >/dev/null 2>&1; then
-        BUSY=$(fuser /dev/vfio/${chip} 2>/dev/null || true)
-        if [ -n "$BUSY" ]; then
-            echo "Device /dev/vfio/${chip} busy (PIDs: $BUSY) — force-killing"
-            fuser -k -9 /dev/vfio/${chip} 2>/dev/null || true
-            sleep 1
-        fi
+# Verify devices are free (handle v6e/v5e/v4 paths)
+DEV_LIST=""
+if ls /dev/vfio/devices/vfio[0-9]* >/dev/null 2>&1; then
+    DEV_LIST=$(ls /dev/vfio/devices/vfio[0-9]* 2>/dev/null || true)
+elif ls /dev/vfio/[0-9]* >/dev/null 2>&1; then
+    DEV_LIST=$(ls /dev/vfio/[0-9]* 2>/dev/null || true)
+elif ls /dev/accel[0-9]* >/dev/null 2>&1; then
+    DEV_LIST=$(ls /dev/accel[0-9]* 2>/dev/null || true)
+fi
+for dev in $DEV_LIST; do
+    BUSY=$(fuser "$dev" 2>/dev/null || true)
+    if [ -n "$BUSY" ]; then
+        echo "Device $dev busy (PIDs: $BUSY) — force-killing"
+        fuser -k -9 "$dev" 2>/dev/null || true
+        sleep 1
     fi
 done
 
@@ -423,6 +440,11 @@ export MODEL_PATH=/tmp/SmolLM2-135M
 export XLA_PERSISTENT_CACHE_PATH=${XLA_DIR}
 export XLA_COMPILATION_CACHE_PATH=${XLA_DIR}
 export WANDB_MODE=${WANDB_MODE:-disabled}
+# Set TPU_LIBRARY_PATH if libtpu installed (C ext needs explicit .so path)
+if [ -z "${TPU_LIBRARY_PATH:-}" ]; then
+    _libtpu_path=$(python3 -c "import libtpu; print(libtpu.get_library_path())" 2>/dev/null || true)
+    [ -n "$_libtpu_path" ] && export TPU_LIBRARY_PATH="$_libtpu_path"
+fi
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTHONUNBUFFERED=1
@@ -441,6 +463,16 @@ sleep 3
 
 if kill -0 $BPID 2>/dev/null; then
     echo "Babysitter running OK (PID=$BPID)"
+    # Safety check: babysitter must NOT run as root.
+    # Root-owned processes create root-owned /tmp files (ckpts, logs) that block future kwokchunau babysitters.
+    _bsit_user=$(ps -o user= -p $BPID 2>/dev/null | tr -d ' ' || true)
+    if [ "$_bsit_user" = "root" ]; then
+        echo "CRITICAL: Babysitter running as root! This will cause /tmp ownership issues."
+        echo "  Kill it and investigate why deploy is running as root."
+        report_phase "FAILED_BABYSITTER_ROOT"
+        exit 1
+    fi
+    echo "Babysitter user: $_bsit_user (non-root OK)"
     report_phase "IDLE_AWAITING_WORK"
 else
     echo "ERROR: Babysitter died! Last log:"

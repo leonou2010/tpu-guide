@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-dashboard.py — Rich TUI dashboard for pull-based coordinator.
+dashboard.py — Rich TUI dashboard for pull-based coordinator (v3).
 
-Reads from GCS coord_v2/ to show real-time sweep progress.
+Adds VM Boot State panel showing deploy phase telemetry per VM.
+Supports --exp name:N to set per-experiment target counts at runtime.
 
 Usage:
-    python3 ~/distributed_tpu_training/pull/dashboard.py --once              # single snapshot
-    watch -c -n30 'python3 ~/distributed_tpu_training/pull/dashboard.py --once'  # live refresh
-    python3 ~/distributed_tpu_training/pull/dashboard.py --interval 30       # auto-refresh
+    python3 ~/distributed_tpu_training/v3/dashboard.py --once
+    python3 ~/distributed_tpu_training/v3/dashboard.py --exp exp13_rerun3:120 --once
+    watch -c -n30 'python3 ~/distributed_tpu_training/v3/dashboard.py --exp exp13_rerun3:120 --once'
+    python3 ~/distributed_tpu_training/v3/dashboard.py --exp exp13_rerun3:120 --interval 30
 """
 
 import argparse
@@ -20,6 +22,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gcs import gcs_list, gcs_read, gcs_read_batch, CONTROL_PLANE
+
+try:
+    from google.cloud import tpu_v2
+    _TPU_CLIENT = tpu_v2.TpuClient()
+    _HAS_TPU_API = True
+except Exception:
+    _TPU_CLIENT = None
+    _HAS_TPU_API = False
+
+_PROJECT = os.environ.get('PROJECT', 'gcp-research-credits-489020')
 
 try:
     from rich.console import Console, Group
@@ -37,14 +49,15 @@ except ImportError:
 
 def fetch_state():
     """Fetch full queue state from GCS. Returns dict."""
-    # List all prefixes in parallel
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=7) as pool:
         futures = {
             pool.submit(gcs_list, f"{CONTROL_PLANE}/pending"): 'pending',
             pool.submit(gcs_list, f"{CONTROL_PLANE}/running"): 'running',
             pool.submit(gcs_list, f"{CONTROL_PLANE}/completed"): 'completed',
             pool.submit(gcs_list, f"{CONTROL_PLANE}/failed"): 'failed',
             pool.submit(gcs_list, f"{CONTROL_PLANE}/heartbeats"): 'heartbeats',
+            pool.submit(gcs_list, f"{CONTROL_PLANE}/telemetry"): 'telemetry',
+            pool.submit(fetch_qr_states): 'qr_states',
         }
         lists = {}
         for fut in as_completed(futures):
@@ -52,10 +65,13 @@ def fetch_state():
             try:
                 lists[key] = fut.result()
             except Exception:
-                lists[key] = []
+                lists[key] = [] if key != 'qr_states' else {}
 
-    # Read running tasks and heartbeats in parallel
-    paths_to_read = lists.get('running', []) + lists.get('heartbeats', [])
+    qr_states = lists.pop('qr_states', {})
+
+    # Read running tasks, heartbeats, and telemetry in parallel
+    paths_to_read = (lists.get('running', []) + lists.get('heartbeats', [])
+                     + lists.get('telemetry', []))
     raw_data = {}
     if paths_to_read:
         raw_data = gcs_read_batch(paths_to_read, max_workers=20)
@@ -77,6 +93,26 @@ def fetch_state():
         if raw:
             try:
                 heartbeats[os.path.basename(path).replace('.json', '')] = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+
+    # Parse telemetry (boot state)
+    vm_boot_states = {}
+    now = time.time()
+    for path in lists.get('telemetry', []):
+        fname = os.path.basename(path)
+        if not fname.endswith('_boot.json'):
+            continue
+        raw = raw_data.get(path)
+        if raw:
+            try:
+                data = json.loads(raw)
+                vm_name = data.get('tpu_name', fname.replace('_boot.json', ''))
+                vm_boot_states[vm_name] = {
+                    'phase': data.get('phase', '?'),
+                    'zone': data.get('zone', '?'),
+                    'age_s': now - data.get('timestamp', now),
+                }
             except json.JSONDecodeError:
                 pass
 
@@ -113,14 +149,58 @@ def fetch_state():
         'failed_count': len(lists.get('failed', [])),
         'running_tasks': running_tasks,
         'heartbeats': heartbeats,
+        'vm_boot_states': vm_boot_states,
+        'qr_states': qr_states,
         'exp_counts': dict(exp_counts),
         'timestamp': time.time(),
     }
 
 
+# ── QueuedResource state fetch ──────────────────────────────────────────────
+
+def fetch_qr_states():
+    """Fetch QueuedResource states for all FLEET VMs from GCP API.
+    Returns dict: {vm_name: {state, zone, accel, age_s}} or empty if API unavailable.
+    """
+    if not _HAS_TPU_API or _TPU_CLIENT is None:
+        return {}
+    try:
+        qrs = _TPU_CLIENT.list_queued_resources(
+            parent=f'projects/{_PROJECT}/locations/-',
+            timeout=10,
+        )
+        result = {}
+        now = time.time()
+        for qr in qrs:
+            qr_id = qr.name.split('/')[-1]
+            zone = qr.name.split('/')[3]
+            state = qr.state.state.name if qr.state else 'UNKNOWN'
+            accel = ''
+            try:
+                accel = qr.tpu.node_spec[0].node.accelerator_type
+            except Exception:
+                pass
+            age_s = 0
+            try:
+                age_s = now - qr.create_time.timestamp()
+            except Exception:
+                pass
+            result[qr_id] = {'state': state, 'zone': zone, 'accel': accel, 'age_s': age_s}
+        return result
+    except Exception:
+        return {}
+
+
 # ── Rendering ────────────────────────────────────────────────────────────
 
-EXP_TARGETS = {'exp13': 120, 'exp12_1': 185, 'exp13_rerun': 120, 'exp13_rerun2': 120}
+# Default targets — overridden by --exp name:N args
+EXP_TARGETS = {
+    'exp13': 120,
+    'exp12_1': 185,
+    'exp13_rerun': 120,
+    'exp13_rerun2': 120,
+    'exp13_rerun3': 120,
+}
 
 
 def format_age(seconds):
@@ -139,7 +219,7 @@ def _build_panels(state, panels):
     # ── Header ───────────────────────────────────────────────────────
     total = state['pending_count'] + state['running_count'] + state['completed_count'] + state['failed_count']
     header = Text()
-    header.append("PULL-BASED COORDINATOR", style="bold cyan")
+    header.append("PULL-BASED COORDINATOR v3", style="bold cyan")
     header.append(f"  {time.strftime('%H:%M:%S')}")
     header.append(f"  total={total}")
     header.append(f"  pending=", style="dim")
@@ -165,7 +245,6 @@ def _build_panels(state, panels):
     exp_table.add_column("Progress", justify="right", min_width=20)
     exp_table.add_column("ETA", justify="right", style="cyan", min_width=10)
 
-    # ETA: track validated rate across dashboard invocations via state file
     _eta_path = "/tmp/dashboard_eta_state.json"
     _now_ts = time.time()
     try:
@@ -184,7 +263,6 @@ def _build_panels(state, panels):
         else:
             bar = "?"
 
-        # ETA: prefer rate-based (from validated history), fall back to step-based estimate
         eta_str = "—"
         if isinstance(target, int) and validated >= target:
             eta_str = "[green]done[/green]"
@@ -193,7 +271,6 @@ def _build_panels(state, panels):
             elapsed = _now_ts - prev.get('ts', _now_ts)
             delta = validated - prev.get('validated', validated)
             if elapsed > 120 and delta > 0:
-                # Rate-based: use actual validation rate
                 secs_left = (target - validated) * elapsed / delta
                 if secs_left < 3600:
                     eta_str = f"~{int(secs_left/60)}m"
@@ -201,16 +278,13 @@ def _build_panels(state, panels):
                     h, m = divmod(int(secs_left / 60), 60)
                     eta_str = f"~{h}h{m:02d}m"
             else:
-                # Step-based fallback: estimate from heartbeat step progress
-                # Known: v6e=5.5s/step, v4=8.5s/step, total=1778 steps/task
                 TOTAL_STEPS = 1778
                 V6E_SECS = 5.5
                 V4_SECS = 8.5
-                # Sum remaining task-seconds across all running chips for this exp
                 total_remaining_chip_secs = 0.0
                 active_chips = 0
                 for wid, hb in state['heartbeats'].items():
-                    if hb.get('task_id', '').startswith(exp + '__') or \
+                    if (hb.get('task_id') or '').startswith(exp + '__') or \
                        any(t.get('experiment') == exp for t in state.get('running_tasks', {}).values()
                            if t.get('worker_id', '').rsplit('_chip', 1)[0] == hb.get('tpu_name', wid.rsplit('_chip', 1)[0])):
                         step = hb.get('step', 0)
@@ -220,12 +294,6 @@ def _build_panels(state, panels):
                         total_remaining_chip_secs += remaining
                         active_chips += 1
                 if active_chips > 0:
-                    pending_tasks = counts.get('pending', 0)
-                    running_tasks = counts.get('running', 0)
-                    # avg remaining for current batch + time for queued tasks
-                    avg_remaining = total_remaining_chip_secs / active_chips
-                    # pending tasks will be dispatched after current ones finish
-                    # with active_chips chips: each "wave" takes avg_task_secs
                     v6e_chips = sum(1 for wid in state['heartbeats']
                                     if 'v6e' in wid or 'ew4' in wid)
                     v4_chips = active_chips - v6e_chips
@@ -265,22 +333,20 @@ def _build_panels(state, panels):
         'us-c1a': {'label': 'us-c1a (v5e)', 'type': 'v5e-4', 'quota': 64, 'per_vm': 4},
     }
 
-    # Map internal VM names (t1v-n-*) to zones by chip count or heartbeat zone field
     _vm_chip_counts = defaultdict(int)
-    _vm_zone_from_hb = {}  # vm_name -> zone string from heartbeat JSON
+    _vm_zone_from_hb = {}
     for wid, hb in state['heartbeats'].items():
         if '_chip' in wid:
             vm = wid.rsplit('_chip', 1)[0]
             _vm_chip_counts[vm] += 1
         else:
             vm = wid
-        # Extract zone from heartbeat if present (new babysitters include this)
         hb_zone = hb.get('zone', '') if isinstance(hb, dict) else ''
         hb_tpu = hb.get('tpu_name', '') if isinstance(hb, dict) else ''
         if hb_zone and vm not in _vm_zone_from_hb:
             _vm_zone_from_hb[vm] = hb_zone
         if hb_tpu and vm not in _vm_zone_from_hb:
-            _vm_zone_from_hb[vm] = hb_tpu  # use tpu_name for zone lookup below
+            _vm_zone_from_hb[vm] = hb_tpu
 
     def _zone_from_name(name):
         if 'ew4a' in name or 'europe-west4-a' in name: return 'eu-w4a'
@@ -291,22 +357,18 @@ def _build_panels(state, panels):
         return ''
 
     def _zone_key(vm_name):
-        # 1. Check name directly (our configured VM names)
         zk = _zone_from_name(vm_name)
         if zk: return zk
-        # 2. Use zone from heartbeat JSON (new babysitters send this)
         hb_info = _vm_zone_from_hb.get(vm_name, '')
         if hb_info:
             zk = _zone_from_name(hb_info)
             if zk: return zk
-        # 3. Fallback: infer from chip count (imprecise for multi-zone v6e)
         chips = _vm_chip_counts.get(vm_name, 0)
-        if chips == 4: return 'us-c2b'   # v4-8 has 4 chips
-        if chips >= 8: return 'eu-w4a'   # v6e-8 (best guess, may be ue1d)
+        if chips == 4: return 'us-c2b'
+        if chips >= 8: return 'eu-w4a'
         if chips > 0: return 'eu-w4a'
         return '?'
 
-    # Aggregate heartbeats by zone
     zone_hb = defaultdict(lambda: {'vms': set(), 'training': 0, 'compiling': 0, 'stuck': 0})
     for wid, hb in state['heartbeats'].items():
         vm = wid.rsplit('_chip', 1)[0] if '_chip' in wid else wid
@@ -314,11 +376,11 @@ def _build_panels(state, panels):
         zone_hb[zk]['vms'].add(vm)
         status = hb.get('status', '?')
         age = now - hb.get('timestamp', 0)
-        if status == 'training' and age < 900:
+        if status == 'training' and age < 1800:
             zone_hb[zk]['training'] += 1
         elif status in ('xla_compile', 'starting') and age < 2700:
             zone_hb[zk]['compiling'] += 1
-        elif age > 900:
+        elif age > 1800:
             zone_hb[zk]['stuck'] += 1
         else:
             zone_hb[zk]['compiling'] += 1
@@ -345,7 +407,6 @@ def _build_panels(state, panels):
         cpct = claimed * 100 // quota if quota else 0
         tpct = training * 100 // quota if quota else 0
 
-        # Visual bar: green=training, yellow=claimed-but-not-training, dim=unclaimed
         bar_w = 40
         t_fill = int(training / quota * bar_w) if quota else 0
         c_fill = int(claimed / quota * bar_w) if quota else 0
@@ -360,7 +421,6 @@ def _build_panels(state, panels):
         reg_table.add_row(q['label'], q['type'], f"{quota}c", str(n_vms),
                          claimed_str, train_str, bar)
 
-    # Totals row
     tot_cpct = tot_c * 100 // tot_q if tot_q else 0
     tot_tpct = tot_t * 100 // tot_q if tot_q else 0
     reg_table.add_row(
@@ -389,11 +449,9 @@ def _build_panels(state, panels):
     worker_table.add_column("HB Age", justify="right", min_width=8)
     worker_table.add_column("Claim Age", justify="right", min_width=10)
 
-    # Group by VM
     vm_workers = defaultdict(list)
     for task_id, task in state['running_tasks'].items():
         worker_id = task.get('worker_id', '?')
-        # Extract VM name from worker_id (format: vmname_chipN)
         vm = worker_id.rsplit('_chip', 1)[0] if '_chip' in worker_id else worker_id
         vm_workers[vm].append((task_id, task, worker_id))
 
@@ -409,7 +467,6 @@ def _build_panels(state, panels):
             step = hb.get('step', 0) if hb else 0
             status = hb.get('status', 'unknown') if hb else 'no_hb'
 
-            # Color status
             if status == 'training':
                 status_str = f"[green]{status}[/green]"
                 total_running += 1
@@ -432,7 +489,6 @@ def _build_panels(state, panels):
                 hb_str, format_age(claim_age)
             )
 
-    # Summary line
     summary = Text()
     summary.append(f"  {len(vm_workers)} VMs", style="bold")
     summary.append(f" | ")
@@ -446,8 +502,7 @@ def _build_panels(state, panels):
     else:
         panels.append(Panel(Text("  No active workers", style="dim"), title="Active Workers", border_style="green"))
 
-    # ── Per-VM health (from heartbeats, grouped by zone) ────────────
-    # Build VM stats from heartbeats (source of truth, not running tasks)
+    # ── Fleet Health ─────────────────────────────────────────────────
     vm_health = defaultdict(lambda: {'training': 0, 'compile': 0, 'stuck': 0, 'idle': 0,
                                       'max_step': 0, 'min_age': 99999, 'type': '?', 'zone': '?'})
     for wid, hb in state['heartbeats'].items():
@@ -459,18 +514,17 @@ def _build_panels(state, panels):
         vm_health[vm]['max_step'] = max(vm_health[vm]['max_step'], step)
         vm_health[vm]['min_age'] = min(vm_health[vm]['min_age'], hb_age)
 
-        if status == 'training' and hb_age < 900:
+        if status == 'training' and hb_age < 1800:
             vm_health[vm]['training'] += 1
         elif status in ('xla_compile', 'starting') and hb_age < 2700:
             vm_health[vm]['compile'] += 1
         elif status == 'idle':
             vm_health[vm]['idle'] += 1
-        elif hb_age > 900:
+        elif hb_age > 1800:
             vm_health[vm]['stuck'] += 1
         else:
             vm_health[vm]['compile'] += 1
 
-        # Determine type and zone from VM name
         if 'v4' in vm:
             vm_health[vm]['type'] = 'v4-8'
         elif 'v5e' in vm:
@@ -478,7 +532,6 @@ def _build_panels(state, panels):
         elif 'v6e' in vm:
             vm_health[vm]['type'] = 'v6e-8'
         else:
-            # Internal name: infer from chip count
             chips = _vm_chip_counts.get(vm, 0)
             if chips >= 8:
                 vm_health[vm]['type'] = 'v6e-8'
@@ -497,7 +550,6 @@ def _build_panels(state, panels):
         elif 'uc2b' in vm:
             vm_health[vm]['zone'] = 'us-c2b'
 
-    # Build table grouped by zone
     vm_table = Table(show_header=True, header_style="bold", expand=True)
     vm_table.add_column("VM", style="cyan", min_width=18)
     vm_table.add_column("Type", min_width=6)
@@ -509,19 +561,16 @@ def _build_panels(state, panels):
     vm_table.add_column("FreshHB", justify="right", min_width=7)
     vm_table.add_column("Health", min_width=10)
 
-    # Group by zone
     zone_vms = defaultdict(list)
     for vm in sorted(vm_health.keys()):
         zone_vms[vm_health[vm]['zone']].append(vm)
 
-    # Aggregate stats
     agg = {'vms': 0, 'training': 0, 'compiling': 0, 'stuck': 0, 'idle': 0}
     zone_agg = defaultdict(lambda: {'vms': 0, 'training': 0, 'compiling': 0, 'stuck': 0})
 
     for zone in sorted(zone_vms.keys()):
         for vm in sorted(zone_vms[zone]):
             h = vm_health[vm]
-            total_active = h['training'] + h['compile'] + h['stuck'] + h['idle']
             agg['vms'] += 1
             agg['training'] += h['training']
             agg['compiling'] += h['compile']
@@ -550,7 +599,6 @@ def _build_panels(state, panels):
                            str(h['training']), str(h['compile']), str(h['stuck']),
                            max_s, fresh, health)
 
-        # Zone subtotal
         za = zone_agg[zone]
         vm_table.add_row(
             f"[bold]{zone} total[/bold]", "", "",
@@ -559,7 +607,6 @@ def _build_panels(state, panels):
             style="dim"
         )
 
-    # Aggregate summary
     agg_text = Text()
     agg_text.append(f"  {agg['vms']} VMs", style="bold")
     agg_text.append(f" | ")
@@ -577,7 +624,127 @@ def _build_panels(state, panels):
 
     panels.append(Panel(Group(agg_text, vm_table), title="Fleet Health", border_style="cyan"))
 
-    # ── Idle workers (heartbeat but no running task) ──────────────────
+    # ── VM Boot State ─────────────────────────────────────────────────
+    # Green: IDLE_AWAITING_WORK | Yellow: INSTALLING_*/DOWNLOADING_*/TESTING_*/intermediate
+    # Red: FAILED_* | Dim: no telemetry yet
+    boot_table = Table(show_header=True, header_style="bold", expand=True)
+    boot_table.add_column("VM", style="cyan", min_width=18)
+    boot_table.add_column("Zone", min_width=13)
+    boot_table.add_column("Phase", min_width=32)
+    boot_table.add_column("Age", justify="right", min_width=6)
+
+    vm_boot_states = state.get('vm_boot_states', {})
+    # Also show VMs from fleet that have no telemetry yet
+    all_vm_names = set(vm_boot_states.keys())
+    # Add VMs from heartbeats that might not have boot telemetry
+    for wid in state['heartbeats']:
+        vm = wid.rsplit('_chip', 1)[0] if '_chip' in wid else wid
+        all_vm_names.add(vm)
+
+    if all_vm_names:
+        for vm in sorted(all_vm_names):
+            boot = vm_boot_states.get(vm)
+            if boot:
+                phase = boot['phase']
+                zone_str = boot['zone'] if boot['zone'] != '?' else _zone_key(vm)
+                age_str = format_age(boot['age_s'])
+                if phase == 'IDLE_AWAITING_WORK':
+                    phase_str = f"[green]{phase} ✓[/green]"
+                elif phase.startswith('FAILED_'):
+                    phase_str = f"[red]{phase} ✗[/red]"
+                else:
+                    phase_str = f"[yellow]{phase}[/yellow]"
+            else:
+                phase_str = "[dim]no telemetry[/dim]"
+                zone_str = _zone_key(vm)
+                age_str = "—"
+            boot_table.add_row(vm, zone_str, phase_str, age_str)
+
+        n_ready = sum(1 for b in vm_boot_states.values() if b['phase'] == 'IDLE_AWAITING_WORK')
+        n_failed = sum(1 for b in vm_boot_states.values() if b['phase'].startswith('FAILED_'))
+        n_in_progress = len(vm_boot_states) - n_ready - n_failed
+
+        boot_summary = Text()
+        boot_summary.append(f"  {n_ready} ready", style="green bold")
+        if n_in_progress > 0:
+            boot_summary.append(f" | {n_in_progress} deploying", style="yellow")
+        if n_failed > 0:
+            boot_summary.append(f" | {n_failed} failed", style="red bold")
+        no_telemetry = len(all_vm_names) - len(vm_boot_states)
+        if no_telemetry > 0:
+            boot_summary.append(f" | {no_telemetry} no telemetry", style="dim")
+
+        panels.append(Panel(Group(boot_summary, boot_table), title="VM Boot State", border_style="yellow"))
+    else:
+        panels.append(Panel(Text("  No VMs in telemetry yet", style="dim"), title="VM Boot State", border_style="yellow"))
+
+    # ── QueuedResource state (metric #5: queuing visibility) ────────────────
+    qr_states = state.get('qr_states', {})
+    if qr_states or _HAS_TPU_API:
+        qr_table = Table(show_header=True, header_style="bold", expand=True)
+        qr_table.add_column("VM", style="cyan", min_width=18)
+        qr_table.add_column("Zone", min_width=13)
+        qr_table.add_column("Type", min_width=6)
+        qr_table.add_column("QR State", min_width=22)
+        qr_table.add_column("Age", justify="right", min_width=8)
+        qr_table.add_column("Deploy", min_width=22)
+
+        QR_COLORS = {
+            'ACTIVE': 'green',
+            'WAITING_FOR_RESOURCES': 'yellow',
+            'PROVISIONING': 'yellow',
+            'DELETING': 'dim',
+            'FAILED': 'red',
+            'SUSPENDED': 'red',
+            'UNKNOWN': 'dim',
+        }
+
+        n_active = n_waiting = n_failed_qr = 0
+        for vm_name in sorted(qr_states.keys()):
+            qr = qr_states[vm_name]
+            st = qr.get('state', 'UNKNOWN')
+            color = QR_COLORS.get(st, 'dim')
+            st_str = f"[{color}]{st}[/{color}]"
+            if st == 'ACTIVE': n_active += 1
+            elif st in ('WAITING_FOR_RESOURCES', 'PROVISIONING'): n_waiting += 1
+            elif st in ('FAILED', 'SUSPENDED'): n_failed_qr += 1
+
+            age_s = qr.get('age_s', 0)
+            age_str = format_age(age_s) if age_s > 0 else '?'
+
+            # Cross-reference with boot telemetry
+            boot = state.get('vm_boot_states', {}).get(vm_name)
+            if boot:
+                phase = boot['phase']
+                if phase == 'IDLE_AWAITING_WORK':
+                    deploy_str = f"[green]{phase} ✓[/green]"
+                elif phase.startswith('FAILED_'):
+                    deploy_str = f"[red]{phase}[/red]"
+                else:
+                    deploy_str = f"[yellow]{phase}[/yellow]"
+            else:
+                deploy_str = "[dim]no telemetry[/dim]"
+
+            qr_table.add_row(vm_name, qr.get('zone', '?'), qr.get('accel', '?'),
+                             st_str, age_str, deploy_str)
+
+        qr_summary = Text()
+        if not qr_states:
+            qr_summary.append("  No QueuedResources yet (vm_manager not started)", style="dim")
+        else:
+            qr_summary.append(f"  {n_active} ACTIVE", style="green bold")
+            if n_waiting:
+                qr_summary.append(f" | {n_waiting} WAITING", style="yellow bold")
+            if n_failed_qr:
+                qr_summary.append(f" | {n_failed_qr} FAILED/SUSPENDED", style="red bold")
+            untracked = len(qr_states) - n_active - n_waiting - n_failed_qr
+            if untracked:
+                qr_summary.append(f" | {untracked} other", style="dim")
+
+        panels.append(Panel(Group(qr_summary, qr_table) if qr_states else qr_summary,
+                           title="QueuedResource State", border_style="blue"))
+
+    # ── Idle workers ─────────────────────────────────────────────────
     idle_workers = []
     for wid, hb in state['heartbeats'].items():
         if hb.get('status') == 'idle':
@@ -589,8 +756,6 @@ def _build_panels(state, panels):
         if len(idle_workers) > 10:
             idle_text.append(f" ... +{len(idle_workers)-10} more", style="dim")
         panels.append(Panel(idle_text, title="Idle", border_style="yellow"))
-
-    # Done building panels
 
 
 def render_rich(state, force_color=False, use_pager=False):
@@ -611,7 +776,7 @@ def render_rich(state, force_color=False, use_pager=False):
 def render_plain(state):
     """Fallback plain text rendering."""
     total = state['pending_count'] + state['running_count'] + state['completed_count'] + state['failed_count']
-    print(f"\n=== PULL COORDINATOR | {time.strftime('%H:%M:%S')} | total={total} ===")
+    print(f"\n=== PULL COORDINATOR v3 | {time.strftime('%H:%M:%S')} | total={total} ===")
     print(f"pending={state['pending_count']} running={state['running_count']} "
           f"completed={state['completed_count']} failed={state['failed_count']}")
 
@@ -631,16 +796,36 @@ def render_plain(state):
         age = format_age(now - hb.get('timestamp', 0)) if hb else 'no_hb'
         print(f"  {wid}: {label} step={step} status={status} hb_age={age}")
 
+    print("\n-- VM Boot States --")
+    for vm, boot in sorted(state.get('vm_boot_states', {}).items()):
+        print(f"  {vm}: {boot['phase']} (zone={boot['zone']} age={format_age(boot['age_s'])})")
+
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Pull-based coordinator dashboard')
+    parser = argparse.ArgumentParser(description='Pull-based coordinator dashboard v3')
     parser.add_argument('--once', action='store_true', help='Single snapshot')
     parser.add_argument('--pager', action='store_true', help='Scrollable colored output (less -R)')
     parser.add_argument('--interval', type=int, default=30, help='Refresh interval')
     parser.add_argument('--plain', action='store_true', help='Plain text (no rich)')
+    parser.add_argument('--exp', nargs='+', metavar='NAME[:N]',
+                        help='Experiments to track. Use name:N to set target count (e.g. exp13_rerun3:120)')
     args = parser.parse_args()
+
+    # Update EXP_TARGETS from --exp args
+    if args.exp:
+        for spec in args.exp:
+            if ':' in spec:
+                name, n = spec.rsplit(':', 1)
+                try:
+                    EXP_TARGETS[name] = int(n)
+                except ValueError:
+                    EXP_TARGETS[name] = spec
+            else:
+                # Just register the experiment (use existing target if known)
+                if spec not in EXP_TARGETS:
+                    EXP_TARGETS[spec] = '?'
 
     if args.plain or not HAS_RICH:
         render = render_plain
@@ -657,7 +842,6 @@ def main():
         render_rich(state, force_color=True, use_pager=True)
         return
 
-    # Live auto-refresh — clear + reprint so terminal scroll works
     if HAS_RICH and not args.plain:
         console = Console()
         try:
@@ -670,13 +854,14 @@ def main():
                     console.print(p)
                 console.print(f"\n[dim]Refreshing in {args.interval}s... (Ctrl+C to quit, scroll up to see all)[/dim]")
 
-                # Check if all done
                 all_done = True
                 for exp, target in EXP_TARGETS.items():
+                    if not isinstance(target, int):
+                        continue
                     counts = state['exp_counts'].get(exp, {})
                     if counts.get('validated', 0) < target:
                         all_done = False
-                if all_done:
+                if all_done and EXP_TARGETS:
                     console.print("\n[bold green]ALL EXPERIMENTS COMPLETE![/bold green]")
                     break
 
@@ -684,7 +869,6 @@ def main():
         except KeyboardInterrupt:
             pass
     else:
-        # Fallback plain loop
         while True:
             os.system('clear')
             state = fetch_state()

@@ -35,7 +35,7 @@ for spec in $EXPERIMENTS; do
   EXP_TOTALS["$name"]="$total"
 done
 
-# Per-experiment validated count
+# Per-experiment validated count + copy results to experiment dir
 all_done=true
 for exp in "${EXP_NAMES[@]}"; do
   total=${EXP_TOTALS[$exp]:-0}
@@ -48,12 +48,81 @@ for exp in "${EXP_NAMES[@]}"; do
     all_done=false
   fi
   echo "  $exp: $status"
+
+  # Copy validated .json results to experiment results/ dir (if resolvable via .env)
+  env_file="$HOME/distributed_tpu_training/experiments/${exp}.env"
+  if [ -f "$env_file" ]; then
+    work_dir=$(grep '^WORK_DIR=' "$env_file" | cut -d= -f2)
+    exp_module=$(grep '^EXP_MODULE=' "$env_file" | cut -d= -f2)
+    # Derive subdirectory from module name (e.g. exp13_tpu_rerun.run_tpu → exp13_tpu_rerun)
+    subdir="${exp_module%%.*}"
+    exp_results_dir="$HOME/sf_bema/experiments/${work_dir}/${subdir}/results"
+    if [ -d "$exp_results_dir" ] && [ -d "$validated_dir" ]; then
+      copied=$(ls "$validated_dir"/*.json 2>/dev/null | wc -l)
+      cp "$validated_dir"/*.json "$exp_results_dir"/ 2>/dev/null && \
+        echo "  → copied $copied result files to $exp_results_dir" || true
+    fi
+  fi
 done
 
 echo ""
 
+# VM usage stats from GCS heartbeats history (best effort)
+echo "--- VM Usage ---"
+for exp in "${EXP_NAMES[@]}"; do
+  validated_dir="${RESULTS_BASE}/${exp}/validated"
+  total_tasks=$(ls "$validated_dir"/*.json 2>/dev/null | wc -l)
+  echo "  $exp: $total_tasks tasks validated"
+  # Wall time: earliest vs latest completed_at in validated results
+  python3 - "$validated_dir" <<'PYEOF' 2>/dev/null || true
+import sys, json, os, glob
+d = sys.argv[1]
+files = glob.glob(os.path.join(d, "*.json"))
+times = []
+retries = []
+for f in files:
+    try:
+        data = json.load(open(f))
+        if "completed_at" in data: times.append(data["completed_at"])
+        retries.append(data.get("retries", 0))
+    except Exception:
+        pass
+if times:
+    wall_h = (max(times) - min(times)) / 3600
+    print(f"  Wall time: {wall_h:.1f}h  |  Tasks with retries: {sum(1 for r in retries if r>0)}/{len(retries)}  |  Total retries: {sum(retries)}")
+PYEOF
+done
+
+echo ""
+
+# Bug summary from failed tasks
+echo "--- Failed Tasks Summary ---"
+python3 - <<'PYEOF' 2>/dev/null || echo "  (no failed task data)"
+import subprocess, json
+ctrl = "gs://gcp-researchcredits-blocklab-europe-west4/coord_v2"
+r = subprocess.run(["gsutil", "ls", f"{ctrl}/failed/"], capture_output=True, text=True)
+paths = [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
+if not paths:
+    print("  0 permanently failed tasks")
+else:
+    errors = {}
+    for p in paths[:20]:
+        raw = subprocess.run(["gsutil", "cat", p], capture_output=True, text=True).stdout
+        try:
+            t = json.loads(raw)
+            e = t.get("last_error", "unknown")[:60]
+            errors[e] = errors.get(e, 0) + 1
+        except Exception:
+            pass
+    print(f"  {len(paths)} permanently failed tasks")
+    for e, c in sorted(errors.items(), key=lambda x: -x[1]):
+        print(f"    {c}x  {e}")
+PYEOF
+
+echo ""
+
 # GCS queue counts
-echo "GCS queue state:"
+echo "--- GCS queue state ---"
 pending=$(gsutil ls "${CTRL}/pending/" 2>/dev/null | wc -l)
 running=$(gsutil ls "${CTRL}/running/" 2>/dev/null | wc -l)
 completed=$(gsutil ls "${CTRL}/completed/" 2>/dev/null | wc -l)

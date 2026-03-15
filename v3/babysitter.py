@@ -19,6 +19,7 @@ Env vars (set by deploy.sh):
 import glob as globmod
 import json
 import os
+import argparse
 import random
 import re
 import shutil
@@ -30,7 +31,9 @@ import time
 # Add pull/ to path for gcs module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gcs import (claim_task, complete_task, fail_task, write_heartbeat,
-                 gcs_write, gcs_copy, gcs_delete_prefix, CONTROL_PLANE)
+                 gcs_write, gcs_copy, gcs_delete_prefix, gcs_exists, CONTROL_PLANE)
+
+DRAIN_FLAG_PATH = f"{CONTROL_PLANE}/flags/drain.json"
 
 # ── Config ───────────────────────────────────────────────────────────────
 
@@ -38,17 +41,15 @@ HEARTBEAT_INTERVAL = 120  # 2 min (was 5 min — reduces false stale reclaims)
 IDLE_POLL_INTERVAL = 30   # seconds between checking for new tasks when idle
 MAX_IDLE_CYCLES = 0       # 0 = never exit (run forever)
 
-TPU_NAME = os.environ.get('TPU_NAME', '')
-if not TPU_NAME or TPU_NAME in ('unknown', 'none', ''):
-    import socket as _socket
-    _derived = _socket.gethostname().split('.')[0]
-    if _derived and _derived not in ('localhost', ''):
-        print(f"[babysitter] WARNING: TPU_NAME not set — derived from hostname: {_derived}", flush=True)
-        TPU_NAME = _derived
-    else:
-        print("[babysitter] FATAL: TPU_NAME is unset and hostname is unusable. "
-              "Set TPU_NAME env var before launching. Exiting.", flush=True)
-        sys.exit(1)
+# Serialize PJRT initialization across chip workers.
+# v6e-8: all chips on the same host share a PJRT session setup.
+# If multiple chips call initialize_singleprocess() simultaneously, they hit
+# PRE_START_SESSION_BARRIER deadlock. Fix: only one chip at a time may start training.
+# Hold lock for 90s — enough for PJRT to initialize before next chip starts.
+_TPU_INIT_LOCK = threading.Lock()
+_TPU_INIT_STAGGER_S = 90
+
+TPU_NAME = ""  # resolved at runtime in main() after parsing CLI/env
 
 # ── Preemption detection (SkyPilot pattern) ───────────────────────────────────
 
@@ -114,6 +115,68 @@ def start_preemption_monitor():
     t = threading.Thread(target=_check_preemption, name="preemption_monitor", daemon=True)
     t.start()
     return t
+
+
+def _apply_cli_env_overrides(argv=None):
+    """Apply CLI overrides for deploy_ue1d.sh / deploy_uc2b.sh.
+
+    Those scripts historically passed --tpu-name/--zone/--bucket/--exp but
+    babysitter only read env vars. This hook bridges that gap so ue1d can
+    upload results and write heartbeats under the expected VM name.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--tpu-name", dest="tpu_name", default=None)
+    parser.add_argument("--zone", dest="zone", default=None)
+    parser.add_argument("--bucket", dest="bucket", default=None)
+    parser.add_argument("--exp", dest="exp", default=None)
+    parser.add_argument("--control-plane", dest="control_plane", default=None)
+    parser.add_argument("--model-path", dest="model_path", default=None)
+    args, _unknown = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
+
+    if args.tpu_name:
+        os.environ["TPU_NAME"] = args.tpu_name
+    if args.zone:
+        os.environ["ZONE"] = args.zone
+    if args.bucket:
+        os.environ["BUCKET"] = args.bucket
+    if args.exp:
+        # Used as a fallback when tasks omit "experiment".
+        os.environ["EXP"] = args.exp
+    if args.model_path:
+        os.environ["MODEL_PATH"] = args.model_path
+
+    if args.control_plane:
+        # gcs.py snapshots CONTROL_PLANE at import time. Update both env + module globals.
+        os.environ["CONTROL_PLANE"] = args.control_plane
+        try:
+            import gcs as _gcs
+            _gcs.CONTROL_PLANE = args.control_plane
+        except Exception:
+            pass
+        global CONTROL_PLANE, DRAIN_FLAG_PATH
+        CONTROL_PLANE = args.control_plane
+        DRAIN_FLAG_PATH = f"{CONTROL_PLANE}/flags/drain.json"
+
+
+def _resolve_tpu_name():
+    """Resolve TPU_NAME from env, else derive from hostname."""
+    global TPU_NAME
+    tpu_name = os.environ.get("TPU_NAME", "")
+    if tpu_name and tpu_name not in ("unknown", "none", ""):
+        TPU_NAME = tpu_name
+        return
+
+    import socket as _socket
+    derived = _socket.gethostname().split(".")[0]
+    if derived and derived not in ("localhost", ""):
+        print(f"[babysitter] WARNING: TPU_NAME not set — derived from hostname: {derived}", flush=True)
+        os.environ["TPU_NAME"] = derived
+        TPU_NAME = derived
+        return
+
+    print("[babysitter] FATAL: TPU_NAME is unset and hostname is unusable. "
+          "Set TPU_NAME env var (or pass --tpu-name). Exiting.", flush=True)
+    sys.exit(1)
 
 
 # ── Sanity check ─────────────────────────────────────────────────────────
@@ -326,11 +389,18 @@ def run_training(task, chip_idx, worker_id):
     hb_thread.start()
 
     log_path = f"/tmp/babysitter_chip{chip_idx}_{label}.log"
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env=env, cwd=work_dir,
-        preexec_fn=os.setpgrp  # new process group (SkyPilot pattern): killpg catches all children
-    )
+    # Serialize PJRT initialization: only one chip starts at a time.
+    # v6e PRE_START_SESSION_BARRIER requires chips not to clash at PJRT init.
+    print(f"[chip{chip_idx}] Waiting for TPU init lock...", flush=True)
+    with _TPU_INIT_LOCK:
+        print(f"[chip{chip_idx}] Launching training subprocess...", flush=True)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=env, cwd=work_dir,
+            preexec_fn=os.setpgrp  # new process group (SkyPilot pattern): killpg catches all children
+        )
+        # Hold lock for _TPU_INIT_STAGGER_S to let PJRT initialize before next chip
+        time.sleep(_TPU_INIT_STAGGER_S)
     # Capture pgid immediately after fork — proc may be gone by cleanup time
     try:
         pgid = os.getpgid(proc.pid)
@@ -372,11 +442,19 @@ def run_training(task, chip_idx, worker_id):
     return proc.returncode, captured_run_name, task_ckpt_dir
 
 
+def _resolve_exp(task):
+    """Resolve experiment name from task dict. Falls back to task_id prefix if field is None."""
+    exp = task.get('experiment')
+    if not exp:
+        exp = task.get('task_id', 'unknown').split('__')[0]
+    return exp
+
+
 def upload_result(task, run_name, work_dir):
     """Upload result JSON to GCS. Returns result summary dict or None."""
     label = task['label']
     bucket = os.environ.get('BUCKET', '')
-    exp = task['experiment']
+    exp = _resolve_exp(task)
 
     # Find result file
     result_files = []
@@ -437,6 +515,16 @@ def chip_worker(chip_idx, num_chips):
             print(f"[chip{chip_idx}] Preemption detected — stopping task claiming", flush=True)
             break
 
+        # Drain mode: populate.py --drain sets this flag before --clear.
+        # Don't claim new tasks while drain is active — finish current task then pause.
+        if gcs_exists(DRAIN_FLAG_PATH):
+            write_heartbeat(worker_id, None, 0, "drain", status="idle")
+            if idle_count % 10 == 0:
+                print(f"[chip{chip_idx}] Drain flag set — not claiming new tasks", flush=True)
+            idle_count += 1
+            time.sleep(IDLE_POLL_INTERVAL)
+            continue
+
         # Claim a task
         task = claim_task(worker_id)
 
@@ -464,7 +552,7 @@ def chip_worker(chip_idx, num_chips):
         # Clean staging
         bucket = os.environ.get('BUCKET', '')
         if bucket:
-            gcs_delete_prefix(f"{bucket}/coord/{task['experiment']}/results/tmp_{label}")
+            gcs_delete_prefix(f"{bucket}/coord/{_resolve_exp(task)}/results/tmp_{label}")
 
         # Run training — returns (rc, run_name, task_ckpt_dir)
         rc, run_name, task_ckpt_dir = run_training(task, chip_idx, worker_id)
@@ -477,7 +565,7 @@ def chip_worker(chip_idx, num_chips):
             # Upload per-step train loss JSONL alongside result (survives cleanup_gcs.sh)
             jsonl_local = f'/tmp/{task_id}_train_loss.jsonl'
             if os.path.exists(jsonl_local) and bucket:
-                gcs_copy(jsonl_local, f"{bucket}/coord/{task['experiment']}/results/{label}/train_loss.jsonl")
+                gcs_copy(jsonl_local, f"{bucket}/coord/{_resolve_exp(task)}/results/{label}/train_loss.jsonl")
             cleanup_checkpoint(run_name, task_ckpt_dir)
             print(f"[chip{chip_idx}] ✓ COMPLETED: {label}", flush=True)
         else:
@@ -500,6 +588,9 @@ def chip_worker(chip_idx, num_chips):
                 'Killed', 'preempted', 'SIGKILL', 'preemption',
                 'libtpu not found', 'libtpu.so',  # missing TPU library — deploy issue, not code bug
                 'OSError: [Errno', 'No module named',  # env setup failures
+                'TPU initialization failed',  # TPU barrier timeout — transient infra issue
+                'Deadline exceeded', 'deadline exceeded',  # gRPC/XLA timeouts
+                'PRE_START_SESSION_BARRIER',  # multi-host barrier timeout on single VM
             ])
             code_fail = (rc == 1) and any(s in last_lines for s in ['Traceback', 'Error:', 'RuntimeError']) and not infra_fail
             if infra_fail:
@@ -584,6 +675,8 @@ def kill_orphan_training():
 
 
 def main():
+    _apply_cli_env_overrides()
+    _resolve_tpu_name()
     kill_orphan_training()
     verify_environment()
     start_preemption_monitor()  # Background GCP preemption detection
